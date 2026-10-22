@@ -35,23 +35,20 @@ pwsh tools/setup.ps1 -Iso "D:\path\to\Dead or Alive 4.iso"
 It checks your tools, extracts the disc image and verifies `default.xex`, downloads the ReXGlue SDK at the tested version, applies this project's SDK patches (`patches/sdk/`), and builds the SDK and the game. The first build takes about 10-30 minutes. Re-running it skips the steps that are already done; `-Iso` is only needed until the game is extracted.
 
 ## Play
-```powershell
-.\run.bat
-```
-The first launch opens the settings menu; after that the game starts directly. `.\run.bat --config` reopens the menu.
+Double-click **`Dead or Alive 4.exe`** in the repository folder (setup builds it there). The first launch opens the settings; **Save & Play** starts the game, and after that it starts directly. Pin it to Start or make a desktop shortcut if you like.
 
-### Settings (`.\run.bat --config`)
-Saved to `doa4.toml` in the repository folder.
+### Settings (`Dead or Alive 4 Settings.exe`)
+Saved to `doa4.toml` in the repository folder; changes apply at the next launch.
 - **Resolution:** 720p (native), 1440p or 4K internal rendering. The default is the largest that fits your tallest monitor.
 - **Fullscreen**
-- **Keyboard as pad:** play with keyboard and mouse (keys below).
 - **Gamertag:** your in-game name (up to 15 characters).
 - **Mute**
+- **Skip the Team Ninja intro movie** (on by default)
 
-Any game flag can also be given on the command line, and wins over `doa4.toml`: `.\run.bat --resolution_scale=1`.
+Any game flag can also be given on the command line, and wins over `doa4.toml`: `& ".\Dead or Alive 4.exe" --resolution_scale=1`.
 
 ### Controls
-Xbox and other gamepads work out of the box. With **Keyboard as pad** on:
+Xbox and other gamepads work out of the box, and the keyboard works at the same time as player 1:
 
 | Pad | Keyboard |
 |---|---|
@@ -69,7 +66,8 @@ Xbox and other gamepads work out of the box. With **Keyboard as pad** on:
 - **`WARNING: clang N; this suite was tested with LLVM 23`**: usually fine. If the build fails, install LLVM 23.
 - **`Cannot create symlinks`**: turn on Developer Mode (Prerequisites), then run setup again.
 - **`SDK snapshot SHA-256 mismatch`**: the download was corrupted; run setup again.
-- **`doa4.toml is invalid (line N: ...)`**: the game starts with default settings; run `.\run.bat --config` to fix them.
+- **`doa4.toml is invalid (line N: ...)`**: the game starts with default settings; fix them in `Dead or Alive 4 Settings.exe`.
+- **`The game is not built yet`**: run `pwsh tools/setup.ps1` (Setup) and check that it ends with `BUILD_OK`.
 - **The game crashes:** it writes a folder `crashes\<timestamp>\` (log, stack, last frame). Attach that folder to your bug report.
 - **Bug report checklist:** the `crashes\<timestamp>` folder if there is one, a screenshot (`pwsh tools/shot.ps1` prints its path while the game runs), and the result of `pwsh tools/smoke.ps1` with the game closed (it boots to the mode-select screen and prints PASS or what failed).
 

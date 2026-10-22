@@ -1,4 +1,4 @@
-# Smoke test: play each input_scripts/smoke_*.txt from launch (via run.bat), then fail on a new
+# Smoke test: play each input_scripts/smoke_*.txt from launch (via "Dead or Alive 4.exe"), then fail on a new
 # crash bundle, a script that never logs 'input_script: done', or a game that exits early.
 # Saves a game-window screenshot per script in shots/. Use it after SDK upgrades and big fixes.
 # Usage: pwsh tools/smoke.ps1 [-Only smoke_boot] [-TimeoutSeconds 120] [-SettleSeconds 3]
@@ -7,13 +7,13 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $logs = Join-Path $root "out\build\$Preset\logs"
 $scripts = Get-ChildItem (Join-Path $root "input_scripts\$Only.txt")
-if (-not $scripts) { throw "No input_scripts\$Only.txt. Record one with run.bat --use_input_rec (F9) and name it smoke_<path>.txt." }
+if (-not $scripts) { throw "No input_scripts\$Only.txt. Record one with .\run.bat --use_input_rec (F9) and name it smoke_<path>.txt." }
 if (Get-Process doa4 -ErrorAction SilentlyContinue) { throw 'Close the game first' }
 
 $failed = 0
 foreach ($s in $scripts) {
     $start = Get-Date
-    Start-Process cmd -ArgumentList "/c `"$root\run.bat`" --input_script=$($s.BaseName)" -WindowStyle Hidden
+    Start-Process (Join-Path $root 'Dead or Alive 4.exe') "--input_script=$($s.BaseName)"
     $result = 'TIMEOUT'
     while (((Get-Date) - $start).TotalSeconds -lt $TimeoutSeconds) {
         Start-Sleep -Milliseconds 500

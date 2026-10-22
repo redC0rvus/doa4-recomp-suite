@@ -15,10 +15,11 @@
 
 // Only main.cpp includes this header, so defining the cvar here is safe.
 REXCVAR_DEFINE_BOOL(mount_cache, true, "Storage", "Mount cache:\\ as a writable host folder");
-REXCVAR_DEFINE_BOOL(skip_boot_movies, false, "Debug",
+REXCVAR_DEFINE_BOOL(skip_boot_movies, true, "Video",
                     "Hide the Team Ninja boot logo movie (movie/ninja_vi_hd.sfd) so the game skips it");
 REXCVAR_DEFINE_STRING(save_checkpoint_dir, "", "Storage",
                       "Copy the save here whenever the game writes it (empty = off)");
+REXCVAR_DECLARE(bool, mnk_mode);  // SDK keyboard-as-pad driver; forced on in OnPreSetup
 
 #include <algorithm>
 #include <chrono>
@@ -102,6 +103,9 @@ class Doa4App : public rex::ReXApp {
   // Default to the Xenos GPU plugin; --gpu_plugin=<name> still overrides.
   void OnPreSetup(rex::RuntimeConfig& config) override {
     if (config.gpu_plugin.empty()) config.gpu_plugin = "xenos";
+    // Keyboard always works alongside pads: the SDK merges it into player 1 (buttons OR'd, the
+    // larger stick wins), so there is nothing to choose. Overrides an old doa4.toml "mnk_mode = false".
+    REXCVAR_SET(mnk_mode, true);
   }
   // void OnLoadXexImage(std::string& xex_image) override {}
   // void OnPostLoadXexImage() override {}

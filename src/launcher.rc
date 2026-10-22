@@ -1,0 +1,23 @@
+#include <windows.h>
+#include "launcher.h"
+
+1 ICON "doa4.ico"
+
+IDD_SETTINGS DIALOGEX 0, 0, 260, 182
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Dead or Alive 4 Settings"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "Resolution", -1, 10, 12, 60, 8
+    COMBOBOX        IDC_RES, 75, 10, 175, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "", IDC_MONITOR, 75, 26, 175, 16
+    AUTOCHECKBOX    "Fullscreen", IDC_FULL, 10, 48, 240, 10
+    AUTOCHECKBOX    "Mute audio", IDC_MUTE, 10, 62, 240, 10
+    AUTOCHECKBOX    "Skip the Team Ninja intro movie", IDC_INTRO, 10, 76, 240, 10
+    LTEXT           "Gamertag", -1, 10, 96, 60, 8
+    EDITTEXT        IDC_TAG, 75, 94, 100, 12, ES_AUTOHSCROLL
+    LTEXT           "Keyboard works alongside pads: Enter = Start, Space = A, Backspace = B, L = X, P = Y, Z = Back, WASD = left stick, arrows = right stick, Shift + arrows = D-pad.", -1, 10, 116, 240, 24
+    DEFPUSHBUTTON   "Save && Play", IDC_PLAY, 90, 158, 60, 14
+    PUSHBUTTON      "Save", IDOK, 155, 158, 45, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 205, 158, 45, 14
+END
