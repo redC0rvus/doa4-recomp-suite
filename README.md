@@ -1,4 +1,5 @@
 # Dead or Alive 4 Recomp
+<img width="2081" height="709" alt="github-banner" src="https://github.com/user-attachments/assets/e24568a6-ed53-4df5-9988-0495ca7531d8" />
 
 Play Dead or Alive 4 natively on Windows, from your own Xbox 360 disc. The game's code is statically recompiled from the disc's `default.xex` with the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) and rendered with Direct3D 12, at up to 4K.
 
