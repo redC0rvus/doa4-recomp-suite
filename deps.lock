@@ -5,7 +5,7 @@
 sdk_url            = https://github.com/rexglue/rexglue-sdk.git
 sdk_commit         = c94f5ebdcb3c9d1a460ca48e04f9758448f8d518            # full 40-char SHA; never a tag
 sdk_label          = v0.10.0-2-gc94f5eb          # human label only, e.g. v0.10.0-2-gc94f5eb
-sdk_archive_url    =                        # release asset from tools/snapshot_sdk.ps1 (empty = clone upstream)
+sdk_archive_url    = https://github.com/redC0rvus/doa4-recomp-suite/releases/download/v0.1.0-beta/rexglue-sdk-c94f5ebdcb3c.tar.gz  # release asset from tools/snapshot_sdk.ps1 (empty = clone upstream)
 sdk_archive_sha256 = 15FA630FF0CD55751891143CE60AF5022D7C81C8E97B62A0776A84786443C811  # out/sdk-snapshot/rexglue-sdk-c94f5ebdcb3c.tar.gz (main checkout), built 2026-10-21; not reproducible byte-for-byte, upload this file
 
 # Toolchain the lock was tested with.
