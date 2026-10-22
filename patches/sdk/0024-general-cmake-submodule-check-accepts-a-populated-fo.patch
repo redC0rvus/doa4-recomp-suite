@@ -1,0 +1,33 @@
+From 4655f2efdb01c3c4950f89014580b2006d87bd2c Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 11:49:00 -0700
+Subject: [PATCH 24/24] [general] cmake: submodule check accepts a populated
+ folder without .git (source snapshots)
+
+thirdparty/CMakeLists.txt required <submodule>/.git, so a source snapshot
+(locked commit + submodules, no .git) failed to configure with 'Git
+submodule is not initialized'. Check that the folder has files instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ thirdparty/CMakeLists.txt | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index f102b56..36461e1 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -64,7 +64,9 @@ if(REXGLUE_BUILD_TESTS)
+ endif()
+ 
+ foreach(submodule ${REQUIRED_SUBMODULES})
+-    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}/.git")
++    # Populated, not ".git exists": a source snapshot (no .git) is a valid checkout too.
++    file(GLOB _submodule_files "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}/*")
++    if(NOT _submodule_files)
+         message(FATAL_ERROR
+             "Git submodule '${submodule}' is not initialized.\n"
+             "Please run: git submodule update --init --recursive\n"
+-- 
+2.49.0.windows.1
+

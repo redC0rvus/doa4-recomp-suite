@@ -1,0 +1,85 @@
+From 89509d72d864135ac152a1e7b8bc529d45af22f4 Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 22:46:17 -0700
+Subject: [PATCH 02/24] [general] filesystem: persist guest-set timestamps to
+ host files
+
+DOAX2 validates its cache:\ archives by timestamp; keeping the times only in
+memory made every launch delete and re-copy ~3 GB of cache.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/filesystem/devices/host_path_entry.cpp | 29 ++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/src/filesystem/devices/host_path_entry.cpp b/src/filesystem/devices/host_path_entry.cpp
+index d0dce00..09cb790 100644
+--- a/src/filesystem/devices/host_path_entry.cpp
++++ b/src/filesystem/devices/host_path_entry.cpp
+@@ -10,6 +10,10 @@
+  */
+ 
+ #include <rex/filesystem/devices/host_path_entry.h>
++#include <rex/platform.h>
++#if REX_PLATFORM_WIN32
++#include "../../core/platform_win.h"
++#endif
+ #include <rex/filesystem/devices/host_path_file.h>
+ 
+ #include <rex/filesystem.h>
+@@ -22,6 +26,28 @@
+ 
+ namespace rex::filesystem {
+ 
++namespace {
++// Persist a guest-set timestamp to the host file so it survives relaunch
++// (games such as DOAX2 validate their cache:\ files by timestamp).
++// which: 0 = creation, 1 = last access, 2 = last write.
++void PersistHostTimestamp([[maybe_unused]] const std::filesystem::path& path,
++                          [[maybe_unused]] int which, [[maybe_unused]] uint64_t timestamp) {
++#if REX_PLATFORM_WIN32
++  HANDLE h = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES,
++                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
++                         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
++  if (h == INVALID_HANDLE_VALUE) {
++    return;
++  }
++  FILETIME ft{static_cast<DWORD>(timestamp), static_cast<DWORD>(timestamp >> 32)};
++  SetFileTime(h, which == 0 ? &ft : nullptr, which == 1 ? &ft : nullptr,
++              which == 2 ? &ft : nullptr);
++  CloseHandle(h);
++#endif
++}
++}  // namespace
++
++
+ HostPathEntry::HostPathEntry(Device* device, Entry* parent, const std::string_view path,
+                              const std::filesystem::path& host_path)
+     : Entry(device, parent, path), host_path_(host_path) {}
+@@ -161,6 +187,7 @@ bool HostPathEntry::SetCreateTimestamp(uint64_t timestamp) {
+     return false;
+   }
+   create_timestamp_ = timestamp;
++  PersistHostTimestamp(host_path_, 0, timestamp);
+   return true;
+ }
+ 
+@@ -169,6 +196,7 @@ bool HostPathEntry::SetAccessTimestamp(uint64_t timestamp) {
+     return false;
+   }
+   access_timestamp_ = timestamp;
++  PersistHostTimestamp(host_path_, 1, timestamp);
+   return true;
+ }
+ 
+@@ -177,6 +205,7 @@ bool HostPathEntry::SetWriteTimestamp(uint64_t timestamp) {
+     return false;
+   }
+   write_timestamp_ = timestamp;
++  PersistHostTimestamp(host_path_, 2, timestamp);
+   return true;
+ }
+ 
+-- 
+2.49.0.windows.1
+

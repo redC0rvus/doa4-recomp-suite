@@ -1,0 +1,92 @@
+From 0530419a0edccd3a8681e70697b383c78d71c44c Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 09:20:51 -0700
+Subject: [PATCH 14/24] [general] system: guest_memory.txt reads safely,
+ registers in r0-r31 order
+
+PPCContext stores r3 first, so indexing from &r0 shifted the labels. A plain read of a write-watched guest page faulted inside the crash handler and cut the bundle short; ReadProcessMemory fails instead. Flush per section.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/crash_bundle.cpp | 44 ++++++++++++++++++-------------------
+ 1 file changed, 22 insertions(+), 22 deletions(-)
+
+diff --git a/src/system/crash_bundle.cpp b/src/system/crash_bundle.cpp
+index 05b6858..9e4cb26 100644
+--- a/src/system/crash_bundle.cpp
++++ b/src/system/crash_bundle.cpp
+@@ -99,49 +99,49 @@ void WriteGuestState(std::ofstream& out) {
+   }
+ }
+ 
+-// True if [p, p+len) is committed, readable host memory (guest pages may be
+-// reserved but never committed; touching those in here would fault again).
+-bool Readable(const uint8_t* p, size_t len) {
+-  MEMORY_BASIC_INFORMATION mbi;
+-  for (const uint8_t* q = p; q < p + len;) {
+-    if (!VirtualQuery(q, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+-        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+-      return false;
+-    q = static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+-  }
+-  return true;
+-}
+-
+ // All GPRs, then 256 bytes of guest memory around each register that points
+-// into committed guest memory, one level deep (e.g. a stream pointer kept in
+-// a struct a register points at). Enough to read the data a crash was chewing.
++// into guest memory, one level deep (e.g. a stream pointer kept in a struct a
++// register points at). Enough to read the data a crash was chewing.
++// Reads go through ReadProcessMemory: it fails instead of faulting on reserved
++// or watched pages, and a fault in here would kill the rest of the bundle.
+ void WriteGuestMemory(std::ofstream& out) {
+   auto* ts = runtime::ThreadState::Get();
+   auto* rt = Runtime::instance();
+   if (!ts || !rt || !rt->virtual_membase()) return;
+   auto* ctx = ts->context();
+   uint8_t* base = rt->virtual_membase();
+-  const PPCRegister* gpr = &ctx->r0;
++  // PPCContext stores r3 first, so index by name, not by offset from r0.
++  const PPCRegister* gpr[32] = {
++      &ctx->r0,  &ctx->r1,  &ctx->r2,  &ctx->r3,  &ctx->r4,  &ctx->r5,  &ctx->r6,  &ctx->r7,
++      &ctx->r8,  &ctx->r9,  &ctx->r10, &ctx->r11, &ctx->r12, &ctx->r13, &ctx->r14, &ctx->r15,
++      &ctx->r16, &ctx->r17, &ctx->r18, &ctx->r19, &ctx->r20, &ctx->r21, &ctx->r22, &ctx->r23,
++      &ctx->r24, &ctx->r25, &ctx->r26, &ctx->r27, &ctx->r28, &ctx->r29, &ctx->r30, &ctx->r31};
+   for (int i = 0; i < 32; ++i)
+-    out << fmt::format("r{:<2} {:016X}{}", i, gpr[i].u64, i % 4 == 3 ? "\n" : "  ");
++    out << fmt::format("r{:<2} {:016X}{}", i, gpr[i]->u64, i % 4 == 3 ? "\n" : "  ");
+   out << fmt::format("lr  {:08X}  ctr {:016X}\n", uint32_t(ctx->lr), ctx->ctr.u64);
++  out.flush();
+ 
++  auto read = [&](uint32_t addr, void* dst, size_t len) {
++    SIZE_T got = 0;
++    return ReadProcessMemory(GetCurrentProcess(), base + addr, dst, len, &got) && got == len;
++  };
+   auto dump = [&](const std::string& label, uint32_t addr) {
+     uint32_t start = (addr & ~0xFu) - 0x40;
+-    if (addr < 0x10000 || !Readable(base + start, 0x100)) return false;
++    uint8_t buf[0x100];
++    if (addr < 0x10000 || !read(start, buf, sizeof(buf))) return false;
+     out << fmt::format("\n{} -> {:08X}\n", label, addr);
+     for (uint32_t row = 0; row < 0x100; row += 16) {
+       out << fmt::format("  {:08X}:", start + row);
+-      for (uint32_t b = 0; b < 16; ++b) out << fmt::format("{}{:02X}", b % 4 ? "" : " ", base[start + row + b]);
++      for (uint32_t b = 0; b < 16; ++b) out << fmt::format("{}{:02X}", b % 4 ? "" : " ", buf[row + b]);
+       out << "\n";
+     }
++    out.flush();
+     return true;
+   };
+   for (int i = 0; i < 32; ++i) {
+-    uint32_t a = gpr[i].u32;
++    uint32_t a = gpr[i]->u32, inner;
+     if (!dump(fmt::format("r{}", i), a)) continue;
+-    uint32_t inner = _byteswap_ulong(*reinterpret_cast<uint32_t*>(base + (a & ~3u)));
+-    dump(fmt::format("*r{}", i), inner);
++    if (read(a & ~3u, &inner, 4)) dump(fmt::format("*r{}", i), _byteswap_ulong(inner));
+   }
+ }
+ 
+-- 
+2.49.0.windows.1
+

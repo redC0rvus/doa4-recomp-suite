@@ -1,0 +1,31 @@
+From 18f3a7d5844ccefce4eb240bede139eef0e8a088 Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 01:20:07 -0700
+Subject: [PATCH 12/24] [general] system: seed FPSCR host state on XHostThreads
+
+GPU interrupts and audio callbacks run guest code on XHostThread contexts that never called fpscr.InitHost(). With csr = 0, the first FlushMode/mtfsf write unmasked every host FP exception and an inexact result killed the process (0xC000008F).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/xthread.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 91957d3..cef200d 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -1454,6 +1454,11 @@ void XHostThread::Execute() {
+   // Let the kernel know we are starting.
+   kernel_state_->OnThreadExecute(this);
+ 
++  // Host threads run guest callbacks (GPU interrupts, audio) on this context.
++  // An unseeded csr (0) would unmask every host FP exception on the first
++  // FlushMode/mtfsf write, and an inexact result then kills the process.
++  thread_state()->context()->fpscr.InitHost();
++
+   int ret = host_fn_();
+ 
+   // Exit.
+-- 
+2.49.0.windows.1
+

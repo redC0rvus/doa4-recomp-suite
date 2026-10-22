@@ -1,0 +1,61 @@
+From f65fff25b9dd0641572f15161f0acd1b0edc86e4 Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 22:14:06 -0700
+Subject: [PATCH 11/24] [general] d3d12: fast/some readback waits for one-off
+ resolves
+
+The delayed readback modes hand the CPU the previous resolve with the same
+key. That is only close enough for a per-frame pass resolved last frame
+too; a one-off resolve got an older, unrelated image. DOAX2 saved each
+photo with the previous photo's thumbnail (duplicate pairs on disk).
+
+Delayed sync now applies only when the key was last used the previous
+frame; otherwise wait like full. --readback_resolve_sync_one_off (default
+true) turns it off. Verified: 4 photos -> 4 distinct correct thumbnails
+(before: duplicate pairs; with readback_resolve=full: distinct).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/d3d12/command_processor.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 4948f80..3075405 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -44,6 +44,9 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
+                     "Read data written by memory export in shaders on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(readback_resolve_sync_one_off, true, "GPU/D3D12",
++                    "fast/some readback: wait for the GPU on resolves not also done last frame "
++                    "(one-off copies), instead of returning the previous copy's data");
+ REXCVAR_DEFINE_STRING(readback_resolve_dump_dir, "", "GPU/D3D12",
+                       "Debug: dump scaled source + 1x result of each new scaled resolve readback "
+                       "(>= 64 KB) for 120 frames after F10 (and at frame 1200) into this folder");
+@@ -2935,6 +2938,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
+   uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
+   ReadbackBuffer& rb = readback_buffers_[resolve_key];
++  uint64_t previous_use_frame = rb.last_used_frame;
+   rb.last_used_frame = frame_current_;
+ 
+   uint32_t write_index = rb.current_index;
+@@ -3135,8 +3139,13 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+   }
+ 
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
++  // The delayed modes hand the CPU the previous resolve with the same key. That
++  // is only close enough when that resolve was last frame's copy of the same
++  // per-frame pass. A one-off resolve gets an older, unrelated image: DOAX2
++  // saved each photo with the previous photo's thumbnail. Wait for those.
+   bool use_delayed_sync =
+-      readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
++      (readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome) &&
++      (!REXCVAR_GET(readback_resolve_sync_one_off) || previous_use_frame + 1 == frame_current_);
+   uint32_t read_index = write_index;
+   if (use_delayed_sync) {
+     read_index = 1 - write_index;
+-- 
+2.49.0.windows.1
+

@@ -1,0 +1,35 @@
+From c81864d925403dd803527f272f5acb6494e8627b Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 22:59:38 -0700
+Subject: [PATCH 03/24] [general] xfile: honor delete-on-close when the guest
+ closes a file
+
+NtSetInformationFile(FileDispositionInformation) only set a flag that nothing
+read, so games could never delete files (DOAX2 cache:\ refresh got stuck).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/xfile.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/system/xfile.cpp b/src/system/xfile.cpp
+index 4179e8b..b5a15a8 100644
+--- a/src/system/xfile.cpp
++++ b/src/system/xfile.cpp
+@@ -37,7 +37,13 @@ XFile::XFile() : XObject(kObjectType) {
+ XFile::~XFile() {
+   // TODO(benvanik): signal that the file is closing?
+   async_event_->Set();
++  auto* entry = file_->entry();
+   file_->Destroy();
++  // Honor FileDispositionInformation (delete on close). If another handle
++  // still holds the host file, removal fails and the next close retries.
++  if (entry && entry->delete_on_close() && entry->parent()) {
++    entry->Delete();
++  }
+ }
+ 
+ uint64_t XFile::position() const {
+-- 
+2.49.0.windows.1
+

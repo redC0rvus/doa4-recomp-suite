@@ -1,0 +1,321 @@
+From a455f6bd8f67665b016e58129614e46685987a95 Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 09:30:56 -0700
+Subject: [PATCH 06/24] [general] system: crash bundle on FATAL / unhandled
+ exception
+
+Writes <crash_bundle_dir>/<timestamp>/ with summary.txt (failure, guest
+thread, LR, back-chain walk resolved to sub_ names, host stack),
+breadcrumbs.txt (last 300 log lines), args.txt, build_info.txt,
+crash.dmp, a copy of the save folder and the last guest frame (BMP).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/system/crash_bundle.h |  18 +++
+ src/system/CMakeLists.txt         |   1 +
+ src/system/crash_bundle.cpp       | 256 ++++++++++++++++++++++++++++++
+ 3 files changed, 275 insertions(+)
+ create mode 100644 include/rex/system/crash_bundle.h
+ create mode 100644 src/system/crash_bundle.cpp
+
+diff --git a/include/rex/system/crash_bundle.h b/include/rex/system/crash_bundle.h
+new file mode 100644
+index 0000000..104b610
+--- /dev/null
++++ b/include/rex/system/crash_bundle.h
+@@ -0,0 +1,18 @@
++/**
++ * @file        rex/system/crash_bundle.h
++ * @brief       Self-contained crash bundle (summary, log tail, dump, save, frame)
++ */
++
++#pragma once
++
++#include <filesystem>
++
++namespace rex::crash {
++
++// On REX_FATAL (abort) or an unhandled host exception, write
++// <crash_bundle_dir>/<timestamp>/ with summary.txt, breadcrumbs.txt, args.txt,
++// crash.dmp, save/ (a copy of save_dir) and frame.bmp. Call once after the
++// runtime and logging are set up. save_dir may be empty.
++void Install(const std::filesystem::path& save_dir);
++
++}  // namespace rex::crash
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index fc46d86..a751b71 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -42,6 +42,7 @@ set(REXSYSTEM_SOURCES
+     map_parser.cpp
+     module.cpp
+     function_dispatcher.cpp
++    crash_bundle.cpp
+     gpu_plugin_loader.cpp
+     thread.cpp
+     thread_state.cpp
+diff --git a/src/system/crash_bundle.cpp b/src/system/crash_bundle.cpp
+new file mode 100644
+index 0000000..eacf698
+--- /dev/null
++++ b/src/system/crash_bundle.cpp
+@@ -0,0 +1,256 @@
++/**
++ * @file        system/crash_bundle.cpp
++ * @brief       Self-contained crash bundle (summary, log tail, dump, save, frame)
++ *
++ * @remarks     Best effort: the process is already dying, so each step is
++ *              written and flushed before the next, riskiest last (the frame
++ *              grab needs the GPU).
++ */
++
++#include <rex/system/crash_bundle.h>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <rex/string.h>
++
++REXCVAR_DEFINE_STRING(crash_bundle_dir, "", "Debug",
++                      "Where crash bundles go (empty = <exe dir>/crashes)");
++
++#if REX_PLATFORM_WIN32
++
++#include <rex/ppc/context.h>
++#include <rex/runtime.h>
++#include <rex/system/function_dispatcher.h>
++#include <rex/system/interfaces/graphics.h>
++#include <rex/system/thread_state.h>
++#include <rex/ui/presenter.h>
++
++#include <spdlog/sinks/ringbuffer_sink.h>
++
++#include <atomic>
++#include <csignal>
++#include <ctime>
++#include <fstream>
++
++#include <windows.h>
++#include <dbghelp.h>
++#pragma comment(lib, "dbghelp.lib")
++
++namespace rex::crash {
++
++namespace {
++
++namespace fs = std::filesystem;
++
++std::atomic_flag g_writing;
++fs::path g_save_dir;
++std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> g_breadcrumbs;
++
++fs::path ExeDir() {
++  wchar_t path[MAX_PATH];
++  GetModuleFileNameW(nullptr, path, MAX_PATH);
++  return fs::path(path).parent_path();
++}
++
++// Nearest function start at or below a guest address, as sub_XXXXXXXX+off.
++// ponytail: linear walk back through the dispatcher table; fine at crash time.
++std::string GuestName(uint32_t addr) {
++  auto* rt = Runtime::instance();
++  auto* disp = rt ? rt->function_dispatcher() : nullptr;
++  if (disp) {
++    uint32_t a = addr & ~3u;
++    for (uint32_t i = 0; i < 0x40000 && a >= 0x80000000u; ++i, a -= 4) {
++      if (disp->GetFunction(a)) return fmt::format("sub_{:08X}+0x{:X}", a, addr - a);
++    }
++  }
++  return fmt::format("0x{:08X} (no function)", addr);
++}
++
++// Guest registers + back-chain walk. Saved LR sits 8 bytes below each
++// caller's frame pointer (stw r12,-8(r1) before stwu).
++void WriteGuestState(std::ofstream& out) {
++  auto* ts = runtime::ThreadState::Get();
++  auto* rt = Runtime::instance();
++  if (!ts || !rt || !rt->virtual_membase()) {
++    out << "Guest thread: none (host-only thread)\n";
++    return;
++  }
++  auto* ctx = ts->context();
++  uint8_t* base = rt->virtual_membase();
++  auto load = [&](uint32_t a) { return _byteswap_ulong(*reinterpret_cast<uint32_t*>(base + a)); };
++
++  out << fmt::format("Guest thread: {:08X}\n", ts->thread_id());
++  out << fmt::format("LR: {:08X}  {}\n", uint32_t(ctx->lr), GuestName(uint32_t(ctx->lr)));
++  out << fmt::format("Last indirect target: {:08X}\n", ctx->last_indirect_target);
++  out << fmt::format("r1 {:08X}  r3 {:08X}  r4 {:08X}  r5 {:08X}  r31 {:08X}\n", ctx->r1.u32,
++                     ctx->r3.u32, ctx->r4.u32, ctx->r5.u32, ctx->r31.u32);
++  out << "Guest stack (back-chain):\n";
++  uint32_t sp = ctx->r1.u32;
++  for (int i = 0; i < 48; ++i) {
++    // Guest stacks live in the 0x70000000 range; stop on anything odd.
++    if (sp < 0x10000 || sp >= 0xF0000000u || (sp & 3)) break;
++    uint32_t next = load(sp);
++    if (next <= sp || next >= 0xF0000000u || (next & 3)) break;
++    uint32_t lr = load(next - 8);
++    if (lr == 0xBCBCBCBC || lr < 0x80000000u) break;
++    out << fmt::format("  #{:<2} {:08X}  {}\n", i, lr, GuestName(lr));
++    sp = next;
++  }
++}
++
++void WriteHostStack(std::ofstream& out) {
++  HANDLE proc = GetCurrentProcess();
++  SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
++  SymInitialize(proc, nullptr, TRUE);
++  void* frames[48];
++  USHORT n = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
++  alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256];
++  auto* sym = reinterpret_cast<SYMBOL_INFO*>(buf);
++  out << "Host stack:\n";
++  for (USHORT i = 0; i < n; ++i) {
++    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
++    sym->MaxNameLen = 255;
++    DWORD64 disp = 0;
++    auto a = reinterpret_cast<DWORD64>(frames[i]);
++    if (SymFromAddr(proc, a, &disp, sym))
++      out << fmt::format("  #{:<2} {}+0x{:X}\n", i, sym->Name, disp);
++    else
++      out << fmt::format("  #{:<2} 0x{:X}\n", i, a);
++  }
++}
++
++void WriteBmp(const fs::path& path, const ui::RawImage& img) {
++  uint32_t row = img.width * 3, pad = (4 - row % 4) % 4;
++  uint32_t data_size = (row + pad) * img.height;
++  std::ofstream f(path, std::ios::binary);
++  auto u16 = [&](uint16_t v) { f.write(reinterpret_cast<char*>(&v), 2); };
++  auto u32 = [&](uint32_t v) { f.write(reinterpret_cast<char*>(&v), 4); };
++  u16(0x4D42); u32(54 + data_size); u32(0); u32(54);
++  u32(40); u32(img.width); u32(img.height); u16(1); u16(24); u32(0); u32(data_size);
++  u32(2835); u32(2835); u32(0); u32(0);
++  std::vector<char> line(row + pad, 0);
++  for (uint32_t y = img.height; y-- > 0;) {  // BMP rows go bottom-up, BGR
++    const uint8_t* src = img.data.data() + y * img.stride;
++    for (uint32_t x = 0; x < img.width; ++x) {
++      line[x * 3 + 0] = src[x * 4 + 2];
++      line[x * 3 + 1] = src[x * 4 + 1];
++      line[x * 3 + 2] = src[x * 4 + 0];
++    }
++    f.write(line.data(), line.size());
++  }
++}
++
++void WriteBundle(const std::string& failure, EXCEPTION_POINTERS* ep) {
++  if (g_writing.test_and_set()) return;  // first crash wins; a crash in here won't loop
++
++  fs::path root = REXCVAR_GET(crash_bundle_dir).empty() ? ExeDir() / "crashes"
++                                                       : fs::path(REXCVAR_GET(crash_bundle_dir));
++  std::time_t now = std::time(nullptr);
++  std::tm tm{};
++  localtime_s(&tm, &now);
++  char stamp[32];
++  std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm);
++  fs::path dir = root / stamp;
++  std::error_code ec;
++  fs::create_directories(dir, ec);
++
++  {
++    std::ofstream out(dir / "summary.txt");
++    out << "Failure: " << failure << "\n";
++    out << fmt::format("Host thread: {}\n", GetCurrentThreadId());
++    WriteGuestState(out);
++    out.flush();
++    WriteHostStack(out);
++  }
++  if (g_breadcrumbs) {
++    std::ofstream out(dir / "breadcrumbs.txt");
++    for (auto& line : g_breadcrumbs->last_formatted()) out << line;
++  }
++  {
++    std::ofstream out(dir / "args.txt");
++    out << "Command line: " << rex::string::to_utf8(
++                                     reinterpret_cast<const char16_t*>(GetCommandLineW())) << "\n\nModified cvars:\n";
++    for (auto& name : cvar::ListModifiedFlags())
++      out << "  " << name << " = " << cvar::GetFlagByName(name) << "\n";
++  }
++  // build.ps1 writes the SDK + game commit hashes here.
++  fs::copy_file(ExeDir() / "build_info.txt", dir / "build_info.txt", ec);
++
++  HANDLE f = CreateFileW((dir / "crash.dmp").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0,
++                         nullptr);
++  if (f != INVALID_HANDLE_VALUE) {
++    MINIDUMP_EXCEPTION_INFORMATION mei{GetCurrentThreadId(), ep, FALSE};
++    MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f, MiniDumpWithThreadInfo,
++                      ep ? &mei : nullptr, nullptr, nullptr);
++    CloseHandle(f);
++  }
++
++  if (!g_save_dir.empty())
++    fs::copy(g_save_dir, dir / "save", fs::copy_options::recursive, ec);
++
++  // Last: needs the GPU, which may be the thing that died.
++  auto* rt = Runtime::instance();
++  auto* gs = rt ? rt->graphics_system() : nullptr;
++  ui::RawImage img;
++  if (gs && gs->presenter() && gs->presenter()->CaptureGuestOutput(img))
++    WriteBmp(dir / "frame.bmp", img);
++
++  REXLOG_CRITICAL("Crash bundle written to {}", dir.string());
++  FlushLogging();
++}
++
++std::string LastFatalLine() {
++  if (g_breadcrumbs) {
++    auto lines = g_breadcrumbs->last_formatted();
++    for (auto it = lines.rbegin(); it != lines.rend(); ++it) {
++      auto pos = it->find("[FATAL]");
++      if (pos != std::string::npos) {
++        auto s = it->substr(pos);
++        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
++        return s;
++      }
++    }
++  }
++  return "abort() (no [FATAL] line in breadcrumbs)";
++}
++
++void OnAbort(int) { WriteBundle(LastFatalLine(), nullptr); }
++
++LONG WINAPI OnUnhandled(EXCEPTION_POINTERS* ep) {
++  auto* rec = ep->ExceptionRecord;
++  std::string failure = fmt::format("host exception 0x{:08X}", uint32_t(rec->ExceptionCode));
++  if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
++    auto addr = rec->ExceptionInformation[1];
++    const char* op = rec->ExceptionInformation[0] == 1 ? "write" : "read";
++    auto* rt = Runtime::instance();
++    auto base = rt ? reinterpret_cast<uintptr_t>(rt->virtual_membase()) : 0;
++    if (base && addr >= base && addr - base < 0x100000000ull)
++      failure = fmt::format("guest AV: {} at guest 0x{:08X}", op, uint32_t(addr - base));
++    else
++      failure = fmt::format("host AV: {} at 0x{:X}", op, addr);
++  }
++  failure += fmt::format(" (RIP 0x{:X})", ep->ContextRecord->Rip);
++  WriteBundle(failure, ep);
++  return EXCEPTION_CONTINUE_SEARCH;
++}
++
++}  // namespace
++
++void Install(const std::filesystem::path& save_dir) {
++  g_save_dir = save_dir;
++  g_breadcrumbs = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(300);
++  g_breadcrumbs->set_pattern("[%H:%M:%S.%e] [%l] [%n] [t%t] %v");
++  AddSink(g_breadcrumbs);
++  std::signal(SIGABRT, OnAbort);
++  SetUnhandledExceptionFilter(OnUnhandled);
++}
++
++}  // namespace rex::crash
++
++#else
++
++namespace rex::crash {
++void Install(const std::filesystem::path&) {}  // ponytail: Windows only for now
++}  // namespace rex::crash
++
++#endif
+-- 
+2.49.0.windows.1
+

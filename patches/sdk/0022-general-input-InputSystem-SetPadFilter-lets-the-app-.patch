@@ -1,0 +1,59 @@
+From 8ce50e3bc8ec1917e7e1862b674f1495605db970 Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 16:37:47 -0700
+Subject: [PATCH 22/24] [general] input: InputSystem::SetPadFilter lets the app
+ edit the merged pad on every GetState (dev tools)
+
+---
+ include/rex/input/input_system.h | 6 ++++++
+ src/input/input_system.cpp       | 3 +++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 1cb3faa..290c43b 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <functional>
+ #include <memory>
+ #include <vector>
+ 
+@@ -42,6 +43,10 @@ class InputSystem : public system::IInputSystem {
+   /// Replaces any previous assignment. Call before the guest starts polling.
+   void SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment);
+ 
++  /// Called on every GetState after the devices are merged; may edit the pad (dev tools: input record/replay).
++  using PadFilter = std::function<void(uint32_t user_index, X_INPUT_GAMEPAD& pad)>;
++  void SetPadFilter(PadFilter filter) { pad_filter_ = std::move(filter); }
++
+   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
+   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
+   X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration);
+@@ -65,6 +70,7 @@ class InputSystem : public system::IInputSystem {
+   // does not renumber pad two.
+   std::vector<DeviceInfo> devices_;
+   std::vector<InputDriver*> device_owners_;
++  PadFilter pad_filter_;
+ };
+ 
+ /// Create a default InputSystem with SDL + NOP drivers.
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..b26f760 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -245,6 +245,9 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   if (!any) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
++  if (pad_filter_) {
++    pad_filter_(user_index, merged.gamepad);
++  }
+   if (out_state) {
+     *out_state = merged;
+   }
+-- 
+2.49.0.windows.1
+

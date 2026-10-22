@@ -1,0 +1,135 @@
+From ce32ada742c40018f07f1037b540b7993051a45b Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 19:56:49 -0700
+Subject: [PATCH 10/24] [general] d3d12: --readback_resolve_dump_dir debug dump
+ of scaled readbacks
+
+When set, F10 (or frame 1200, for unattended runs) arms a 120-frame
+window that writes, per readback key, the scaled source range (.src), the
+1x downscale result (.dst) and metadata (.txt). Off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/d3d12/command_processor.cpp | 75 +++++++++++++++++++++++-
+ 1 file changed, 74 insertions(+), 1 deletion(-)
+
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 53a92fb..4948f80 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <unordered_set>
++#include <fstream>
+ #include <filesystem>
+ #include <rex/system/flight_recorder.h>
+ #include <rex/ui/renderdoc_api.h>
+@@ -42,6 +44,9 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
+                     "Read data written by memory export in shaders on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_STRING(readback_resolve_dump_dir, "", "GPU/D3D12",
++                      "Debug: dump scaled source + 1x result of each new scaled resolve readback "
++                      "(>= 64 KB) for 120 frames after F10 (and at frame 1200) into this folder");
+ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
+                     "Read render-to-texture results on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -2967,6 +2972,10 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+     return true;
+   }
+ 
++  // Debug dump (--readback_resolve_dump_dir): scaled source range of new keys.
++  Microsoft::WRL::ComPtr<ID3D12Resource> dump_buffer;
++  uint32_t dump_scaled_length = 0, dump_pixel_size_log2 = 0;
++  uint64_t dump_scaled_address = 0;
+   if (is_scaled) {
+     if (!resolve_downscale_pipeline_ || !resolve_downscale_root_signature_) {
+       return true;
+@@ -3052,10 +3061,40 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+     ui::d3d12::util::CreateBufferRawUAV(device, downscale_descriptors[1].first,
+                                         resolve_downscale_buffer_.Get(), aligned_written_length, 0);
+ 
++    // F10 arms the dump for the next 120 frames, one dump per readback key.
++    static std::unordered_set<uint64_t> dumped_keys;
++    static uint64_t dump_until_frame = 0;
++    bool dump = false;
++    if (!REXCVAR_GET(readback_resolve_dump_dir).empty()) {
++      if (((GetAsyncKeyState(VK_F10) & 0x8000) || frame_current_ == 1200) &&
++          frame_current_ > dump_until_frame) {
++        dump_until_frame = frame_current_ + 120;
++        dumped_keys.clear();
++        REXGPU_INFO("Readback dump armed for 120 frames");
++      }
++      dump = frame_current_ <= dump_until_frame && written_length >= 65536 &&
++             dumped_keys.insert(resolve_key).second;
++    }
+     PushUAVBarrier(scaled_resolve_buffer);
+     texture_cache_->TransitionCurrentScaledResolveRange(
+-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++        dump ? D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
++                                     D3D12_RESOURCE_STATE_COPY_SOURCE)
++             : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+     SubmitBarriers();
++    if (dump) {
++      D3D12_RESOURCE_DESC dump_desc;
++      ui::d3d12::util::FillBufferResourceDesc(dump_desc, aligned_scaled_length,
++                                              D3D12_RESOURCE_FLAG_NONE);
++      if (SUCCEEDED(device->CreateCommittedResource(
++              &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &dump_desc,
++              D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&dump_buffer)))) {
++        deferred_command_list_.D3DCopyBufferRegion(dump_buffer.Get(), 0, scaled_resolve_buffer,
++                                                   source_offset, scaled_length);
++        dump_scaled_length = scaled_length;
++        dump_scaled_address = scaled_address - scaled_buffer_base;
++        dump_pixel_size_log2 = pixel_size_log2;
++      }
++    }
+ 
+     SetExternalPipeline(resolve_downscale_pipeline_.Get());
+     deferred_command_list_.D3DSetComputeRootSignature(resolve_downscale_root_signature_.Get());
+@@ -3115,6 +3154,40 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+     }
+   }
+ 
++  if (dump_buffer && AwaitAllQueueOperationsCompletion()) {
++    static int dump_index = 0;
++    std::filesystem::path dir(REXCVAR_GET(readback_resolve_dump_dir));
++    std::error_code ec;
++    std::filesystem::create_directories(dir, ec);
++    auto stem = dir / fmt::format("{:03}", dump_index++);
++    void* mapped = nullptr;
++    D3D12_RANGE range = {0, dump_scaled_length};
++    if (SUCCEEDED(dump_buffer->Map(0, &range, &mapped))) {
++      std::ofstream(stem.string() + ".src", std::ios::binary)
++          .write(static_cast<const char*>(mapped), dump_scaled_length);
++      D3D12_RANGE none = {0, 0};
++      dump_buffer->Unmap(0, &none);
++    }
++    if (rb.mapped_data[write_index]) {
++      std::ofstream(stem.string() + ".dst", std::ios::binary)
++          .write(static_cast<const char*>(rb.mapped_data[write_index]), written_length);
++    }
++    auto pitch = register_file_->Get<reg::RB_COPY_DEST_PITCH>();
++    auto info = register_file_->Get<reg::RB_COPY_DEST_INFO>();
++    std::ofstream(stem.string() + ".txt")
++        << fmt::format(
++               "frame={} written_address=0x{:08X} written_length={} pixel_size_log2={} "
++               "scale={}x{} scaled_range_offset_in_buffer={} scaled_length={} "
++               "dest_pitch={} dest_height={} dest_format={} dest_endian={}\n",
++               frame_current_, written_address, written_length, dump_pixel_size_log2,
++               texture_cache_->draw_resolution_scale_x(), texture_cache_->draw_resolution_scale_y(),
++               dump_scaled_address, dump_scaled_length, uint32_t(pitch.copy_dest_pitch),
++               uint32_t(pitch.copy_dest_height), uint32_t(info.copy_dest_format),
++               uint32_t(info.copy_dest_endian));
++    REXGPU_INFO("Readback dump {}: 0x{:08X} {} bytes", stem.string(), written_address,
++                written_length);
++  }
++
+   bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
+   if (should_copy && rb.buffers[read_index] && written_length <= rb.sizes[read_index] &&
+       rb.mapped_data[read_index]) {
+-- 
+2.49.0.windows.1
+

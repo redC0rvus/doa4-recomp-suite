@@ -1,0 +1,66 @@
+From a84ed33d77fb0546b6b6d47fe8fd6931efba8553 Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 14:12:57 -0700
+Subject: [PATCH 08/24] [general] perf: --perf_log_csv actually writes, in
+ every config
+
+Nothing ever opened the CSV, so the flag produced no file. XE_SWAP now opens
+it on the first swap and measures frame time unconditionally; Release (where
+the counter macros compile out) feeds the writer directly.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/command_processor.cpp | 20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a744375..b9a110c 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -45,6 +45,8 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+ REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DECLARE(std::string, perf_log_csv);
++
+ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
+                       "Controls CPU readback of render-to-texture resolve results.\n"
+                       " none: Disable readback (default)\n"
+@@ -930,20 +932,30 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+                                                   uint32_t count) {
+   SCOPE_profile_cpu_f("gpu");
+ 
+-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
++  // Frame time is measured in every config so --perf_log_csv also works in
++  // Release (counter macros compile out there; the CSV writer doesn't).
+   {
+     static uint64_t last_frame_tick = 0;
+     uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+     if (last_frame_tick) {
+       uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
+       int64_t dt_us = static_cast<int64_t>((now - last_frame_tick) * 1000000 / freq);
+-      PROFILE_FRAME_TIME_US(dt_us);
+-      PROFILE_FPS(freq / (now - last_frame_tick));
++      rex::perf::SetCounter(rex::perf::CounterId::kFrameTimeUs, dt_us);
++      rex::perf::SetCounter(rex::perf::CounterId::kFps, freq / (now - last_frame_tick));
+     }
+     last_frame_tick = now;
++    // Nothing else opened the CSV, so --perf_log_csv never produced a file.
++    static bool csv_opened = false;
++    if (!csv_opened) {
++      csv_opened = true;
++      rex::perf::SetCsvLogPath(REXCVAR_GET(perf_log_csv));
++    }
+   }
+-#endif
+   rex::perf::Profiler::Flip();
++#ifndef REXGLUE_ENABLE_PERF_COUNTERS
++  rex::perf::ResetFrameCounters();
++  rex::perf::WriteCsvFrame();
++#endif
+ 
+   // Xenia-specific VdSwap hook.
+   // VdSwap will post this to tell us we need to swap the screen/fire an
+-- 
+2.49.0.windows.1
+

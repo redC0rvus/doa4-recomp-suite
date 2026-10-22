@@ -1,0 +1,46 @@
+From d0ebf262c68c8108beec5fe8d73a2a4be4a13d75 Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 09:45:54 -0700
+Subject: [PATCH 15/24] [general] memory: --guest_low_reserve_mb keeps
+ bottom-up 4KB allocations high
+
+Reserves 0x10000..N MB in the v00000000 heap. DOA4 relocates file-relative offsets only when they are below the buffer base; with its anm buffer at 0x10000, offsets >= 0x10000 (Brad, Hayabusa) stayed unrelocated and the motion interpreter ran a data table.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/xmemory.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..d2e8998 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -35,6 +35,10 @@
+ 
+ REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_INT32(guest_low_reserve_mb, 0, "Memory",
++                     "Keep bottom-up 4KB-page allocations above this many MB (0 = from 64KB). "
++                     "For games that tell offsets from pointers by comparing against the buffer base")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
+                     "Protect released memory to prevent accesses");
+@@ -209,6 +213,14 @@ bool Memory::Initialize() {
+                                   : memory::kMemoryProtectNoAccess);
+   heaps_.physical.AllocFixed(0x1FFF0000, 0x10000, 0x10000, memory::kMemoryAllocationReserve,
+                              memory::kMemoryProtectNoAccess);
++  // Optionally keep the low guest heap empty above the zero page, so bottom-up
++  // allocations start higher (reserved, never committed).
++  if (uint32_t mb = uint32_t(std::max(REXCVAR_GET(guest_low_reserve_mb), 0)); mb) {
++    uint32_t top = std::min(mb, 0x3FFu) << 20;
++    if (top > 0x10000)
++      heaps_.v00000000.AllocFixed(0x10000, top - 0x10000, 4096, memory::kMemoryAllocationReserve,
++                                  memory::kMemoryProtectNoAccess);
++  }
+ 
+   // GPU writeback.
+   // 0xC... is physical, 0x7F... is virtual. We may need to overlay these.
+-- 
+2.49.0.windows.1
+

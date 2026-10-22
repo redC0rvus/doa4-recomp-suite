@@ -1,0 +1,168 @@
+From d2e0c0bcaf4f6e8d3be8702a4f773c6198f3ac46 Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:59:11 -0700
+Subject: [PATCH 05/24] [general] gpu: render_target_edram_wrap cvar +
+ log_render_targets debug logging
+
+A render target bound alone has its estimated EDRAM range limited only by
+the estimated height, and the last one may wrap around to tile 0. DOAX2
+draws a 4x MSAA depth-only pass at tile 720 with no usable height bound
+(height_used=1024), so it claimed z@720+2048 - all of EDRAM - and took
+ownership of the 1x color image at tiles 0-719. The next resolve of that
+image read depth data, so relax-mode scenes, pool mats/objects, beach
+sand and minigame frames came out black on the host RT path (ROV was
+correct but slow).
+
+render_target_edram_wrap=false clamps the last range to the end of
+EDRAM instead of wrapping. Default stays true (upstream behavior).
+
+log_render_targets logs guest RT setup changes (incl. base collisions),
+claimed EDRAM ranges (marking wraps), resolves and swaps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/flags.h                  |  2 +
+ src/graphics/d3d12/command_processor.cpp      |  4 ++
+ src/graphics/d3d12/render_target_cache.cpp    | 12 +++++
+ src/graphics/pipeline/render_target/cache.cpp | 50 ++++++++++++++++++-
+ 4 files changed, 67 insertions(+), 1 deletion(-)
+
+diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
+index 2cf24c4..babe7b7 100644
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -43,6 +43,8 @@ REXCVAR_DECLARE(bool, native_2x_msaa);
+ REXCVAR_DECLARE(bool, snorm16_render_target_full_range);
+ REXCVAR_DECLARE(bool, mrt_edram_used_range_clamp_to_min);
+ REXCVAR_DECLARE(bool, direct_host_resolve);
++REXCVAR_DECLARE(bool, log_render_targets);
++REXCVAR_DECLARE(bool, render_target_edram_wrap);
+ 
+ // GPU Textures
+ REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index f929c8f..e97c634 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -2257,6 +2257,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   // was not called), to prevent leaking per-frame resources.
+   EndSubmission(true);
+ 
++  if (REXCVAR_GET(log_render_targets)) {
++    REXGPU_INFO("RTLOG swap");
++  }
++
+   // DOAX2 debug: under RenderDoc, F11 captures one whole guest frame (swap to
+   // swap). RenderDoc's own F12 only grabs the presenter's blit.
+   static auto renderdoc = rex::ui::RenderDocAPI::CreateIfConnected();
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index dd321a5..40248b3 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -1175,6 +1175,18 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+     return false;
+   }
+ 
++  if (REXCVAR_GET(log_render_targets)) {
++    REXGPU_INFO(
++        "RTLOG resolve copyctl={:08X} color_edram={:08X}@{} depth_edram={:08X}@{} {}x{} "
++        "dest=0x{:08X} destinfo={:08X} clear(z={:08X} c={:08X})",
++        resolve_info.rb_copy_control.value, resolve_info.color_edram_info.packed,
++        resolve_info.color_original_base, resolve_info.depth_edram_info.packed,
++        resolve_info.depth_original_base, resolve_info.coordinate_info.width_div_8 * 8,
++        resolve_info.height_div_8 * 8, resolve_info.copy_dest_base,
++        resolve_info.copy_dest_info.value, resolve_info.rb_depth_clear,
++        resolve_info.rb_color_clear);
++  }
++
+   // Nothing to copy/clear.
+   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
+     return true;
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 953c5fd..5412bf1 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -41,6 +41,14 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
+                     "Resolve from host render targets directly to shared memory when possible")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(render_target_edram_wrap, true, "GPU",
++                    "Let the last bound render target's estimated EDRAM range wrap around to "
++                    "tile 0. DOAX2: false, or a depth-only pass steals ownership of the color "
++                    "image at the start of EDRAM and it resolves black");
++
++REXCVAR_DEFINE_BOOL(log_render_targets, false, "GPU",
++                    "DOAX2 debug: log render target setup changes, resolves and swaps");
++
+ namespace rex::graphics {
+ 
+ void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format,
+@@ -495,6 +503,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+     }
+   }
+ 
++  uint32_t rts_used_before_collisions = depth_and_color_rts_used_bits;
++
+   uint32_t rts_remaining;
+   uint32_t rt_index;
+ 
+@@ -532,6 +542,25 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+     }
+   }
+ 
++  // DOAX2 debug: log the guest render target setup whenever it changes.
++  if (REXCVAR_GET(log_render_targets) && is_rasterization_done) {
++    static std::string last_rt_log;
++    std::string rt_log = fmt::format("pitch={} msaa={}x depthctl={:08X} colormask={:04X}",
++                                     pitch_pixels, 1u << uint32_t(msaa_samples),
++                                     normalized_depth_control.value, normalized_color_mask);
++    for (uint32_t i = 0; i <= xenos::kMaxColorRenderTargets; ++i) {
++      if (rts_used_before_collisions & (uint32_t(1) << i)) {
++        rt_log += fmt::format(" {}@{}:fmt{}{}", i ? fmt::format("c{}", i - 1) : std::string("z"),
++                              edram_bases[i], resource_formats[i],
++                              (depth_and_color_rts_used_bits & (uint32_t(1) << i)) ? "" : "(DROPPED)");
++      }
++    }
++    if (rt_log != last_rt_log) {
++      REXGPU_INFO("RTLOG rt {}", rt_log);
++      last_rt_log = std::move(rt_log);
++    }
++  }
++
+   // Clear ownership transfers before adding any.
+   if (!interlock_barrier_only) {
+     for (size_t i = 0; i < rex::countof(last_update_transfers_); ++i) {
+@@ -654,10 +683,29 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+                                             rt_max_distance_tiles_at_64bpp >> (rt_is_64bpp ^ 1)),
+                                    ((i + 1 < edram_bases_sorted_count)
+                                         ? edram_bases_sorted[i + 1].first
+-                                        : (xenos::kEdramTileCount + edram_bases_sorted[0].first)) -
++                                        : (REXCVAR_GET(render_target_edram_wrap)
++                                               ? xenos::kEdramTileCount + edram_bases_sorted[0].first
++                                               : xenos::kEdramTileCount)) -
+                                        rt_base);
+   }
+ 
++  if (REXCVAR_GET(log_render_targets)) {
++    static std::string last_own_log;
++    std::string own_log = fmt::format("height_used={}", height_used);
++    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
++      uint32_t bit = edram_bases_sorted[i].second;
++      own_log += fmt::format(" {}@{}+{}{}", bit ? fmt::format("c{}", bit - 1) : std::string("z"),
++                             edram_bases_sorted[i].first, rt_lengths_tiles[i],
++                             edram_bases_sorted[i].first + rt_lengths_tiles[i] > xenos::kEdramTileCount
++                                 ? "(WRAPS)"
++                                 : "");
++    }
++    if (own_log != last_own_log) {
++      REXGPU_INFO("RTLOG own {}", own_log);
++      last_own_log = std::move(own_log);
++    }
++  }
++
+   if (interlock_barrier_only) {
+     // Because a full pixel shader interlock barrier may clear the ownership map
+     // (since it flushes all previous writes, and there's no need for another
+-- 
+2.49.0.windows.1
+

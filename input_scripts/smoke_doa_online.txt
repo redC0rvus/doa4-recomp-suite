@@ -1,0 +1,7 @@
+# Boot -> Mode Select -> DOA ONLINE. Waits count from launch, then from the previous step.
+wait 3593
+press START 63
+wait 1418
+hold lx -32767 87
+wait 912
+press START 51

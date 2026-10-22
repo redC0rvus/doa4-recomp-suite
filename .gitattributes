@@ -1,0 +1,7 @@
+# git am needs the patches byte-exact; keep autocrlf away from them.
+patches/** -text
+# Codegen rewrites these with LF; check them out LF so a fresh clone stays clean.
+doa4_manifest.toml text eol=lf
+generated/rexglue.cmake text eol=lf
+# cmd misreads labels (call :x, goto) in LF-only batch files; keep them CRLF on every clone.
+*.bat text eol=crlf

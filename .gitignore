@@ -1,0 +1,11 @@
+out/
+original rom/
+generated/default/
+thirdparty/
+crashes/
+shots/
+saves/
+*.dmp
+__pycache__/
+doa4.toml
+input_scripts/_*.txt

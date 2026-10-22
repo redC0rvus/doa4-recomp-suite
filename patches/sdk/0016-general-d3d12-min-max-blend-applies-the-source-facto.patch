@@ -1,0 +1,159 @@
+From 782109d26b1466b6b580d2264cc56d65cacb446e Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 19:43:20 -0700
+Subject: [PATCH 16/24] [general] d3d12: min/max blend applies the source
+ factor in the shader (RTV path)
+
+Xenos applies blend factors to min/max, Direct3D 12 ignores them. With a ONE
+destination factor, scale the RT0 source by SrcColor/SrcAlpha/inverse/Zero in
+the pixel shader (new modification bits) so max(src*factor, dst) matches.
+Fixes the white box behind DOA4's PRESS START glow (SrcAlpha/One/Max).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ .../pipeline/shader/dxbc_translator.h         | 18 ++++++++-
+ src/graphics/d3d12/pipeline_cache.cpp         | 33 +++++++++++++++
+ .../pipeline/shader/dxbc_translator_om.cpp    | 40 +++++++++++++++++++
+ 3 files changed, 90 insertions(+), 1 deletion(-)
+
+diff --git a/include/rex/graphics/pipeline/shader/dxbc_translator.h b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+index 3b0fd61..493fdce 100644
+--- a/include/rex/graphics/pipeline/shader/dxbc_translator.h
++++ b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+@@ -111,7 +111,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
+     // If anything in this is structure is changed in a way not compatible with
+     // the previous layout, invalidate the pipeline storages by increasing this
+     // version number (0xYYYYMMDD)!
+-    static constexpr uint32_t kVersion = 0x20260226;
++    static constexpr uint32_t kVersion = 0x20261015;
+ 
+     enum class DepthStencilMode : uint32_t {
+       kNoModifiers,
+@@ -139,6 +139,19 @@ class DxbcShaderTranslator : public ShaderTranslator {
+       kFloat24Rounding,
+     };
+ 
++    // Xenos applies the blend factors to min / max blending, Direct3D 12 ignores
++    // them. When the destination factor is ONE, max(src * factor, dst) is
++    // reproduced by scaling the source in the shader (RTV path, render target 0
++    // only), with fixed-function ONE factors.
++    enum class MinMaxSrcFactor : uint32_t {
++      kOne,
++      kZero,
++      kSrcColor,
++      kInvSrcColor,
++      kSrcAlpha,
++      kInvSrcAlpha,
++    };
++
+     uint64_t value;
+     struct VertexShaderModification {
+       // uint32_t 0.
+@@ -176,6 +189,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
+       uint32_t dynamic_addressable_register_count : 8;
+       // Non-ROV - depth / stencil output mode.
+       DepthStencilMode depth_stencil_mode : 2;
++      // Non-ROV - render target 0 min / max blending source factors.
++      MinMaxSrcFactor rt0_minmax_color_src_factor : 3;
++      MinMaxSrcFactor rt0_minmax_alpha_src_factor : 3;
+     } pixel;
+ 
+     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
+diff --git a/src/graphics/d3d12/pipeline_cache.cpp b/src/graphics/d3d12/pipeline_cache.cpp
+index 8e6b854..ac73671 100644
+--- a/src/graphics/d3d12/pipeline_cache.cpp
++++ b/src/graphics/d3d12/pipeline_cache.cpp
+@@ -890,6 +890,39 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
+         modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
+       }
+     }
++
++    // Min / max blending ignores the factors in Direct3D 12 - apply the source
++    // factor in the shader instead (only possible with a destination factor
++    // of ONE, as in DOA4's PRESS START glow: max(src * src_alpha, dst)).
++    using MinMaxSrcFactor = DxbcShaderTranslator::Modification::MinMaxSrcFactor;
++    auto minmax_src_factor = [](xenos::BlendOp op, xenos::BlendFactor src, xenos::BlendFactor dest,
++                                bool alpha) {
++      if ((op != xenos::BlendOp::kMin && op != xenos::BlendOp::kMax) ||
++          dest != xenos::BlendFactor::kOne) {
++        return MinMaxSrcFactor::kOne;
++      }
++      switch (src) {
++        case xenos::BlendFactor::kZero:
++          return MinMaxSrcFactor::kZero;
++        case xenos::BlendFactor::kSrcColor:
++          return alpha ? MinMaxSrcFactor::kSrcAlpha : MinMaxSrcFactor::kSrcColor;
++        case xenos::BlendFactor::kOneMinusSrcColor:
++          return alpha ? MinMaxSrcFactor::kInvSrcAlpha : MinMaxSrcFactor::kInvSrcColor;
++        case xenos::BlendFactor::kSrcAlpha:
++          return MinMaxSrcFactor::kSrcAlpha;
++        case xenos::BlendFactor::kOneMinusSrcAlpha:
++          return MinMaxSrcFactor::kInvSrcAlpha;
++        default:
++          return MinMaxSrcFactor::kOne;
++      }
++    };
++    auto blendcontrol0 = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[0]);
++    modification.pixel.rt0_minmax_color_src_factor =
++        minmax_src_factor(blendcontrol0.color_comb_fcn, blendcontrol0.color_srcblend,
++                          blendcontrol0.color_destblend, false);
++    modification.pixel.rt0_minmax_alpha_src_factor =
++        minmax_src_factor(blendcontrol0.alpha_comb_fcn, blendcontrol0.alpha_srcblend,
++                          blendcontrol0.alpha_destblend, true);
+   }
+ 
+   return modification;
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_om.cpp b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
+index a7d508a..d9b21f3 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_om.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
+@@ -1548,6 +1548,46 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
+              LoadSystemConstant(SystemConstants::Index::kColorExpBias,
+                                 offsetof(SystemConstants, color_exp_bias) + sizeof(float) * i,
+                                 dxbc::Src::kXXXX));
++    if (i == 0) {
++      // Min / max blending with a ONE destination factor: Xenos does
++      // max(src * factor, dst), Direct3D 12 would ignore the factor - scale the
++      // source here (the pipeline sets the fixed-function factors to ONE).
++      using MinMaxSrcFactor = Modification::MinMaxSrcFactor;
++      MinMaxSrcFactor minmax_color = GetDxbcShaderModification().pixel.rt0_minmax_color_src_factor;
++      MinMaxSrcFactor minmax_alpha = GetDxbcShaderModification().pixel.rt0_minmax_alpha_src_factor;
++      if (minmax_color != MinMaxSrcFactor::kOne || minmax_alpha != MinMaxSrcFactor::kOne) {
++        // gamma_temp = factors, built from the unscaled color before it's changed.
++        for (uint32_t j = 0; j < 2; ++j) {
++          MinMaxSrcFactor factor = j ? minmax_alpha : minmax_color;
++          dxbc::Dest factor_dest(dxbc::Dest::R(gamma_temp, j ? 0b1000 : 0b0111));
++          dxbc::Src source(j ? dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW)
++                             : dxbc::Src::R(system_temp_color));
++          switch (factor) {
++            case MinMaxSrcFactor::kZero:
++              a_.OpMov(factor_dest, dxbc::Src::LF(0.0f));
++              break;
++            case MinMaxSrcFactor::kSrcColor:
++              a_.OpMov(factor_dest, source, true);
++              break;
++            case MinMaxSrcFactor::kSrcAlpha:
++              a_.OpMov(factor_dest, dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW), true);
++              break;
++            case MinMaxSrcFactor::kInvSrcColor:
++              a_.OpMAd(factor_dest, source, dxbc::Src::LF(-1.0f), dxbc::Src::LF(1.0f), true);
++              break;
++            case MinMaxSrcFactor::kInvSrcAlpha:
++              a_.OpMAd(factor_dest, dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
++                       dxbc::Src::LF(-1.0f), dxbc::Src::LF(1.0f), true);
++              break;
++            default:
++              a_.OpMov(factor_dest, dxbc::Src::LF(1.0f));
++              break;
++          }
++        }
++        a_.OpMul(dxbc::Dest::R(system_temp_color), dxbc::Src::R(system_temp_color),
++                 dxbc::Src::R(gamma_temp));
++      }
++    }
+     if (gamma_render_target_as_unorm8_) {
+       // Convert to gamma space - this is incorrect, since it must be done after
+       // blending on the Xbox 360, but this is just one of many blending issues
+-- 
+2.49.0.windows.1
+

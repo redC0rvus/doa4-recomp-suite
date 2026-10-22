@@ -1,0 +1,50 @@
+From ba22b5e1c5cc6e7dcd68780c5ebc5a506e6c3e30 Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 00:34:21 -0700
+Subject: [PATCH 19/24] [general] xam: XamContentGetThumbnail keeps the
+ caller's size after a successful copy
+
+DOA4's album reuses one size variable for every photo's thumbnail. Writing
+each thumbnail's real size back shrank it, so the next larger thumbnail
+returned X_ERROR_INSUFFICIENT_BUFFER and its slot showed the previous photo.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/xam/xam_content.cpp | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
+index 1fb1e16..49b0841 100644
+--- a/src/kernel/xam/xam_content.cpp
++++ b/src/kernel/xam/xam_content.cpp
+@@ -338,8 +338,11 @@ u32 XamContentGetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
+   auto result =
+       REX_KERNEL_STATE()->content_manager()->GetContentThumbnail(xuid, content_data, &buffer);
+ 
+-  *buffer_size_ptr = uint32_t(buffer.size());
+-
++  // A successful copy leaves the caller's size alone. DOA4's album passes the
++  // same size variable for every photo, so shrinking it to one thumbnail's
++  // size made the next, larger thumbnail fail and its slot repeat the previous
++  // preview. PNG data is self-delimiting, so the larger size is harmless.
++  bool copied = false;
+   if (XSUCCEEDED(result)) {
+     // Write data, if we were given a pointer.
+     // This may have just been a size query.
+@@ -350,9 +353,13 @@ u32 XamContentGetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
+       } else {
+         // Copy data.
+         std::memcpy((uint8_t*)buffer_ptr, buffer.data(), buffer.size());
++        copied = true;
+       }
+     }
+   }
++  if (!copied) {
++    *buffer_size_ptr = uint32_t(buffer.size());
++  }
+ 
+   if (overlapped_ptr) {
+     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
+-- 
+2.49.0.windows.1
+

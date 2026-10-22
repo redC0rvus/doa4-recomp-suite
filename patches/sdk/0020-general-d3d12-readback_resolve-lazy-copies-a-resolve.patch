@@ -1,0 +1,501 @@
+From 9158ba88fee82e4f15322eb72fe6a1bbea3dbe7b Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 01:29:55 -0700
+Subject: [PATCH 20/24] [general] d3d12: --readback_resolve=lazy copies a
+ resolve when the CPU first touches it
+
+The resolved guest pages go no-access; the first CPU access (or a physical
+free) calls a memory data provider that waits for that submission and copies.
+Resolves the GPU already finished are filled at frame start. Exact like full,
+but only waits for the resolves the CPU actually reads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/command_processor.h      |   1 +
+ .../rex/graphics/d3d12/command_processor.h    |  29 +++
+ include/rex/system/xmemory.h                  |  24 +++
+ src/graphics/command_processor.cpp            |   9 +-
+ src/graphics/d3d12/command_processor.cpp      | 174 ++++++++++++++++++
+ src/system/xmemory.cpp                        |  86 ++++++++-
+ 6 files changed, 318 insertions(+), 5 deletions(-)
+
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index da8e432..87adf74 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -44,6 +44,7 @@ enum class ReadbackResolveMode {
+   kFast,
+   kSome,
+   kFull,
++  kLazy,
+ };
+ 
+ struct SwapState {
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 96d362b..b49f0e8 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -382,6 +382,35 @@ class D3D12CommandProcessor : public CommandProcessor {
+     uint64_t last_used_frame = 0;
+   };
+   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
++
++  // readback_resolve=lazy: resolves whose CPU copy waits for the first CPU
++  // access. Their guest pages are no-access until filled. In resolve order.
++  // Protected by the global critical region.
++  struct LazyReadback {
++    uint64_t key;
++    uint32_t address;  // Physical.
++    uint32_t length;
++    const void* source;  // Mapped readback buffer.
++    uint64_t submission;
++  };
++  std::vector<LazyReadback> lazy_readbacks_;
++  // A lazy readback was recorded into the open submission (command processor
++  // thread only); ending the submission before waiting lets the CPU get it.
++  bool lazy_readback_in_open_submission_ = false;
++  uint32_t lazy_readback_thread_id_ = 0;
++  static bool LazyReadbackProviderThunk(void* context, uint32_t address, uint32_t length,
++                                        bool discard,
++                                        std::unique_lock<std::recursive_mutex>& global_lock);
++  bool LazyReadbackProvide(uint32_t address, uint32_t length, bool discard,
++                           std::unique_lock<std::recursive_mutex>& global_lock);
++  // Indices of the pending readbacks sharing pages with the range, transitively
++  // (filling one unprotects its pages), in resolve order.
++  std::vector<size_t> LazyReadbackClosure(uint32_t address, uint32_t length) const;
++  // Copies, unprotects and removes; global lock held, GPU work complete.
++  void LazyReadbackFill(const std::vector<size_t>& indices, bool discard);
++  // Frame end: fills everything the GPU already finished, without waiting.
++  void LazyReadbackFillCompleted();
++  void PrepareForWait() override;
+   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
+   static constexpr size_t kMaxReadbackBuffers = 256;
+   static constexpr uint64_t kReadbackBufferEvictionAgeFrames = 60;
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+index 0c39a42..b33cbaf 100644
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -315,6 +315,9 @@ class PhysicalHeap : public BaseHeap {
+ 
+   void EnableAccessCallbacks(uint32_t physical_address, uint32_t length,
+                              bool enable_invalidation_notifications, bool enable_data_providers);
++  // Lazy resolve readback: makes the system pages of a physical range no-access
++  // (protect), or restores their normal protection (read-only if watched).
++  void SetDataProviderProtection(uint32_t physical_address, uint32_t length, bool protect);
+   // Returns true if any page in the range was watched.
+   bool TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
+                         uint32_t virtual_address, uint32_t length, bool is_write,
+@@ -501,6 +504,25 @@ class Memory {
+                                            bool enable_invalidation_notifications,
+                                            bool enable_data_providers);
+ 
++  // Lazy resolve readback (GPU): fills pending GPU-written data for a physical
++  // range before the CPU touches it. Called with the global lock held once; may
++  // release and retake it. discard: the range is being freed, drop the data.
++  // Returns whether anything was pending in the range.
++  typedef bool (*PhysicalDataProvider)(void* context, uint32_t physical_address, uint32_t length,
++                                       bool discard,
++                                       std::unique_lock<std::recursive_mutex>& global_lock);
++  void SetPhysicalDataProvider(PhysicalDataProvider provider, void* context);
++  bool CallPhysicalDataProvider(uint32_t physical_address, uint32_t length, bool discard,
++                                std::unique_lock<std::recursive_mutex>& global_lock) {
++    return physical_data_provider_ &&
++           physical_data_provider_(physical_data_provider_context_, physical_address, length,
++                                   discard, global_lock);
++  }
++  // No-access (protect) or normal protection for all virtual views of a
++  // physical range. Global lock must be held.
++  void SetPhysicalDataProviderProtection(uint32_t physical_address, uint32_t length,
++                                         bool protect);
++
+   // Forces triggering of watch callbacks for a virtual address range if pages
+   // are watched there and unwatching them. Returns whether any page was
+   // watched. Must be called with global critical region locking depth of 1.
+@@ -624,6 +646,8 @@ class Memory {
+   rex::thread::global_critical_region global_critical_region_;
+   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
+       physical_memory_invalidation_callbacks_;
++  PhysicalDataProvider physical_data_provider_ = nullptr;
++  void* physical_data_provider_context_ = nullptr;
+ };
+ 
+ }  // namespace rex::memory
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index b9a110c..2839c84 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -52,8 +52,10 @@ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
+                       " none: Disable readback (default)\n"
+                       " fast: Read previous frame (delayed, copy every frame)\n"
+                       " some: Read previous frame (delayed, copy on cache miss)\n"
+-                      " full: Immediate sync readback (accurate but stalls)")
+-    .allowed({"none", "fast", "some", "full"})
++                      " full: Immediate sync readback (accurate but stalls)\n"
++                      " lazy: Copy when the CPU first touches the resolved memory (exact; waits\n"
++                      "       only for resolves the CPU reads; D3D12)")
++    .allowed({"none", "fast", "some", "full", "lazy"})
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
+@@ -98,6 +100,9 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
+   if (value == "full") {
+     return ReadbackResolveMode::kFull;
+   }
++  if (value == "lazy") {
++    return ReadbackResolveMode::kLazy;
++  }
+   return ReadbackResolveMode::kDisabled;
+ }
+ 
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index bc4cc48..e7502b2 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -875,6 +875,8 @@ bool D3D12CommandProcessor::SetupContext() {
+   }
+   InvalidateAllVertexBufferResidency();
+   UpdateDebugMarkersEnabled();
++  lazy_readback_thread_id_ = rex::thread::current_thread_system_id();
++  memory_->SetPhysicalDataProvider(LazyReadbackProviderThunk, this);
+ 
+   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+   ID3D12Device* device = provider.GetDevice();
+@@ -1642,6 +1644,8 @@ bool D3D12CommandProcessor::SetupContext() {
+ 
+ void D3D12CommandProcessor::ShutdownContext() {
+   AwaitAllQueueOperationsCompletion();
++  LazyReadbackFillCompleted();
++  memory_->SetPhysicalDataProvider(nullptr, nullptr);
+   InvalidateAllVertexBufferResidency();
+   ShutdownOcclusionQueryResources();
+ 
+@@ -3171,6 +3175,25 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+   }
+ 
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
++  if (readback_mode == ReadbackResolveMode::kLazy && rb.mapped_data[write_index]) {
++    // No wait here: protect the guest range, the first CPU access waits for
++    // this submission and copies (LazyReadbackProvide). DOAX2/DOA4 album
++    // previews resolve a new image into the same buffer every frame and read
++    // it at once, so only this resolve's data is right.
++    auto global_lock = rex::thread::global_critical_region::AcquireDirect();
++    // The same key's older copy is fully overwritten - drop it.
++    lazy_readbacks_.erase(
++        std::remove_if(lazy_readbacks_.begin(), lazy_readbacks_.end(),
++                       [&](const LazyReadback& entry) { return entry.key == resolve_key; }),
++        lazy_readbacks_.end());
++    lazy_readbacks_.push_back(
++        {resolve_key, written_address, written_length, rb.mapped_data[write_index],
++         submission_current_});
++    memory_->SetPhysicalDataProviderProtection(written_address, written_length, true);
++    lazy_readback_in_open_submission_ = true;
++    rb.current_index = 1 - rb.current_index;
++    return true;
++  }
+   // The delayed modes hand the CPU the previous resolve with the same key. That
+   // is only close enough when that resolve was last frame's copy of the same
+   // per-frame pass. A one-off resolve gets an older, unrelated image: DOAX2
+@@ -3500,6 +3523,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+       view_bindful_heap_pool_->Reclaim(frame_completed_);
+       sampler_bindful_heap_pool_->Reclaim(frame_completed_);
+     }
++    LazyReadbackFillCompleted();
+     EvictOldReadbackBuffers(readback_buffers_);
+     EvictOldReadbackBuffers(memexport_readback_buffers_);
+ 
+@@ -3585,6 +3609,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     direct_queue->Signal(submission_fence_, submission_current_++);
+ 
+     submission_open_ = false;
++    lazy_readback_in_open_submission_ = false;
+ 
+     // Queue operations done directly (like UpdateTileMappings) will be awaited
+     // alongside the last submission if needed.
+@@ -4895,6 +4920,16 @@ void D3D12CommandProcessor::EvictOldReadbackBuffers(
+     ReadbackBuffer& readback = it->second;
+     bool evict =
+         buffer_map.size() > kMaxReadbackBuffers || readback.last_used_frame < eviction_frame_floor;
++    if (evict && &buffer_map == &readback_buffers_) {
++      // A pending lazy readback still copies from this buffer.
++      auto global_lock = rex::thread::global_critical_region::AcquireDirect();
++      for (const LazyReadback& entry : lazy_readbacks_) {
++        if (entry.key == it->first) {
++          evict = false;
++          break;
++        }
++      }
++    }
+     if (!evict) {
+       ++it;
+       continue;
+@@ -4916,6 +4951,145 @@ void D3D12CommandProcessor::EvictOldReadbackBuffers(
+   }
+ }
+ 
++bool D3D12CommandProcessor::LazyReadbackProviderThunk(
++    void* context, uint32_t address, uint32_t length, bool discard,
++    std::unique_lock<std::recursive_mutex>& global_lock) {
++  return static_cast<D3D12CommandProcessor*>(context)->LazyReadbackProvide(address, length,
++                                                                           discard, global_lock);
++}
++
++std::vector<size_t> D3D12CommandProcessor::LazyReadbackClosure(uint32_t address,
++                                                               uint32_t length) const {
++  // Page granularity: protection is per 4 KB page, so readbacks sharing a page
++  // must be filled together, in resolve order.
++  constexpr uint32_t kPageShift = 12;
++  std::vector<bool> taken(lazy_readbacks_.size(), false);
++  std::vector<std::pair<uint32_t, uint32_t>> page_ranges = {
++      {address >> kPageShift, (address + std::max(length, 1u) - 1) >> kPageShift}};
++  bool grew = true;
++  while (grew) {
++    grew = false;
++    for (size_t i = 0; i < lazy_readbacks_.size(); ++i) {
++      if (taken[i]) {
++        continue;
++      }
++      const LazyReadback& entry = lazy_readbacks_[i];
++      uint32_t first = entry.address >> kPageShift;
++      uint32_t last = (entry.address + entry.length - 1) >> kPageShift;
++      for (const auto& range : page_ranges) {
++        if (first <= range.second && last >= range.first) {
++          taken[i] = true;
++          page_ranges.emplace_back(first, last);
++          grew = true;
++          break;
++        }
++      }
++    }
++  }
++  std::vector<size_t> indices;
++  for (size_t i = 0; i < taken.size(); ++i) {
++    if (taken[i]) {
++      indices.push_back(i);
++    }
++  }
++  return indices;
++}
++
++void D3D12CommandProcessor::LazyReadbackFill(const std::vector<size_t>& indices, bool discard) {
++  for (size_t i : indices) {
++    const LazyReadback& entry = lazy_readbacks_[i];
++    if (!discard) {
++      uint8_t* destination = memory_->TranslatePhysical(entry.address);
++      if (destination) {
++        std::memcpy(destination, entry.source, entry.length);
++      }
++    }
++  }
++  for (size_t i : indices) {
++    memory_->SetPhysicalDataProviderProtection(lazy_readbacks_[i].address,
++                                               lazy_readbacks_[i].length, false);
++  }
++  for (auto it = indices.rbegin(); it != indices.rend(); ++it) {
++    lazy_readbacks_.erase(lazy_readbacks_.begin() + *it);
++  }
++}
++
++bool D3D12CommandProcessor::LazyReadbackProvide(
++    uint32_t address, uint32_t length, bool discard,
++    std::unique_lock<std::recursive_mutex>& global_lock) {
++  bool provided = false;
++  while (true) {
++    std::vector<size_t> indices = LazyReadbackClosure(address, length);
++    if (indices.empty()) {
++      return provided;
++    }
++    provided = true;
++    uint64_t needed_submission = 0;
++    for (size_t i : indices) {
++      needed_submission = std::max(needed_submission, lazy_readbacks_[i].submission);
++    }
++    if (!discard && submission_fence_->GetCompletedValue() < needed_submission) {
++      if (rex::thread::current_thread_system_id() == lazy_readback_thread_id_) {
++        // The command processor itself touched the range; it can submit.
++        CheckSubmissionFence(needed_submission);
++      } else {
++        // Let the command processor run (it may need the lock to reach the
++        // point where it submits), then recheck - the entries may have changed.
++        global_lock.unlock();
++        static thread_local HANDLE wait_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
++        uint32_t waited_ms = 0;
++        while (submission_fence_->GetCompletedValue() < needed_submission) {
++          submission_fence_->SetEventOnCompletion(needed_submission, wait_event);
++          if (WaitForSingleObject(wait_event, 1000) == WAIT_TIMEOUT) {
++            waited_ms += 1000;
++            REXGPU_WARN("Lazy readback: waited {} ms for submission {} (0x{:08X})", waited_ms,
++                        needed_submission, address);
++          }
++        }
++        global_lock.lock();
++        continue;
++      }
++    }
++    LazyReadbackFill(indices, discard);
++    return provided;
++  }
++}
++
++void D3D12CommandProcessor::LazyReadbackFillCompleted() {
++  auto global_lock = rex::thread::global_critical_region::AcquireDirect();
++  if (lazy_readbacks_.empty()) {
++    return;
++  }
++  uint64_t completed = submission_fence_->GetCompletedValue();
++  size_t i = 0;
++  while (i < lazy_readbacks_.size()) {
++    if (lazy_readbacks_[i].submission > completed) {
++      ++i;
++      continue;
++    }
++    std::vector<size_t> indices =
++        LazyReadbackClosure(lazy_readbacks_[i].address, lazy_readbacks_[i].length);
++    bool all_completed = true;
++    for (size_t j : indices) {
++      all_completed &= lazy_readbacks_[j].submission <= completed;
++    }
++    if (!all_completed) {
++      ++i;
++      continue;
++    }
++    LazyReadbackFill(indices, false);
++    i = 0;
++  }
++}
++
++void D3D12CommandProcessor::PrepareForWait() {
++  // The guest may be blocked on a lazy readback from the open submission.
++  if (lazy_readback_in_open_submission_ && submission_open_) {
++    EndSubmission(false);
++  }
++  CommandProcessor::PrepareForWait();
++}
++
+ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
+   if (size == 0) {
+     return nullptr;
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index d2e8998..96a26ad 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -702,6 +702,19 @@ void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint
+                                          enable_invalidation_notifications, enable_data_providers);
+ }
+ 
++void Memory::SetPhysicalDataProvider(PhysicalDataProvider provider, void* context) {
++  auto lock = global_critical_region_.Acquire();
++  physical_data_provider_ = provider;
++  physical_data_provider_context_ = context;
++}
++
++void Memory::SetPhysicalDataProviderProtection(uint32_t physical_address, uint32_t length,
++                                               bool protect) {
++  heaps_.vA0000000.SetDataProviderProtection(physical_address, length, protect);
++  heaps_.vC0000000.SetDataProviderProtection(physical_address, length, protect);
++  heaps_.vE0000000.SetDataProviderProtection(physical_address, length, protect);
++}
++
+ uint32_t Memory::SystemHeapAlloc(uint32_t size, uint32_t alignment, uint32_t system_heap_flags) {
+   // TODO(benvanik): lightweight pool.
+   bool is_physical = !!(system_heap_flags & memory::kSystemHeapPhysical);
+@@ -2018,6 +2031,7 @@ bool PhysicalHeap::AllocSystemHeap(uint32_t size, uint32_t alignment, uint32_t a
+ 
+ bool PhysicalHeap::Decommit(uint32_t address, uint32_t size) {
+   auto global_lock = global_critical_region_.Acquire();
++  memory_->CallPhysicalDataProvider(GetPhysicalAddress(address), size, true, global_lock);
+ 
+   uint32_t parent_address = GetPhysicalAddress(address);
+   if (!parent_heap_->Decommit(parent_address, size)) {
+@@ -2033,6 +2047,11 @@ bool PhysicalHeap::Decommit(uint32_t address, uint32_t size) {
+ 
+ bool PhysicalHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
+   auto global_lock = global_critical_region_.Acquire();
++  uint32_t discard_size;
++  if (QuerySize(base_address, &discard_size)) {
++    memory_->CallPhysicalDataProvider(GetPhysicalAddress(base_address), discard_size, true,
++                                      global_lock);
++  }
+ 
+   uint32_t parent_base_address = GetPhysicalAddress(base_address);
+   if (!parent_heap_->Release(parent_base_address, out_region_size)) {
+@@ -2184,13 +2203,74 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
+   }
+ }
+ 
++void PhysicalHeap::SetDataProviderProtection(uint32_t physical_address, uint32_t length,
++                                             bool protect) {
++  uint32_t physical_address_offset = GetPhysicalAddress(heap_base_);
++  if (physical_address < physical_address_offset) {
++    if (physical_address_offset - physical_address >= length) {
++      return;
++    }
++    length -= physical_address_offset - physical_address;
++    physical_address = physical_address_offset;
++  }
++  uint32_t heap_relative_address = physical_address - physical_address_offset;
++  if (heap_relative_address >= heap_size_ || !length) {
++    return;
++  }
++  length = std::min(length, heap_size_ - heap_relative_address);
++  uint32_t system_page_first = (heap_relative_address + host_address_offset()) / system_page_size_;
++  uint32_t system_page_last =
++      std::min((heap_relative_address + length - 1 + host_address_offset()) / system_page_size_,
++               system_page_count_ - 1);
++  uint8_t* protect_base = membase_ + heap_base_;
++  // Batch runs of pages with the same target access into one Protect call.
++  uint32_t run_first = UINT32_MAX;
++  rex::memory::PageAccess run_access = rex::memory::PageAccess::kNoAccess;
++  for (uint32_t i = system_page_first; i <= system_page_last + 1; ++i) {
++    bool page_valid = false;
++    rex::memory::PageAccess access = rex::memory::PageAccess::kNoAccess;
++    if (i <= system_page_last) {
++      uint32_t guest_page_number =
++          rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
++      if (guest_page_number < page_table_.size()) {
++        access = ToPageAccess(page_table_[guest_page_number].current_protect);
++        // Inaccessible pages need real access violations - leave them alone.
++        page_valid = access != rex::memory::PageAccess::kNoAccess;
++        if (protect) {
++          access = rex::memory::PageAccess::kNoAccess;
++        } else if (system_page_flags_[i >> 6].notify_on_invalidation &
++                   (uint64_t(1) << (i & 63))) {
++          access = rex::memory::PageAccess::kReadOnly;
++        }
++      }
++    }
++    if (run_first != UINT32_MAX && (!page_valid || access != run_access)) {
++      rex::memory::Protect(protect_base + run_first * system_page_size_,
++                           (i - run_first) * system_page_size_, run_access);
++      run_first = UINT32_MAX;
++    }
++    if (page_valid && run_first == UINT32_MAX) {
++      run_first = i;
++      run_access = access;
++    }
++  }
++}
++
+ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
+                                     uint32_t virtual_address, uint32_t length, bool is_write,
+                                     bool unwatch_exact_range, bool unprotect) {
+-  // TODO(Triang3l): Support read watches.
+-  assert_true(is_write);
++  // Lazy resolve readback: the GPU data must land before the CPU reads or
++  // partially overwrites it.
++  bool provided = false;
++  if (virtual_address + length > heap_base_ && virtual_address < heap_base_ + heap_size_) {
++    uint32_t provide_address = std::max(virtual_address, heap_base_);
++    uint32_t provide_length =
++        std::min(virtual_address + length, heap_base_ + heap_size_) - provide_address;
++    provided = memory_->CallPhysicalDataProvider(GetPhysicalAddress(provide_address),
++                                                 provide_length, false, global_lock_locked_once);
++  }
+   if (!is_write) {
+-    return false;
++    return provided;
+   }
+ 
+   if (virtual_address < heap_base_) {
+-- 
+2.49.0.windows.1
+

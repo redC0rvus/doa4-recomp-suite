@@ -1,0 +1,45 @@
+From 91cc27ce6eb5006595b2c2e1a8b9442948bab143 Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 15:46:53 -0700
+Subject: [PATCH 21/24] [general] xam: XamShowSigninUI sends XN_SYS_UI on, then
+ off after 100 ms
+
+Games that wait for the Guide's open->close edge before re-checking sign-in
+(DOA4's DOA ONLINE) soft-locked: the stub only sent XN_SYS_UI off.
+---
+ src/kernel/xam/xam_user.cpp | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/kernel/xam/xam_user.cpp b/src/kernel/xam/xam_user.cpp
+index 8778066..360d75e 100644
+--- a/src/kernel/xam/xam_user.cpp
++++ b/src/kernel/xam/xam_user.cpp
+@@ -13,6 +13,7 @@
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
+ #include <cstring>
++#include <thread>
+ 
+ #include <rex/cvar.h>
+ #include <rex/kernel/xam/private.h>
+@@ -482,9 +483,14 @@ u32 XamShowSigninUI_entry(u32 unk, u32 unk_mask) {
+   // alone):
+   // XN_SYS_SIGNINCHANGED
+   REX_KERNEL_STATE()->BroadcastNotification(0x0000000A, 1);
+-  // Games seem to sit and loop until we trigger this notification:
+-  // XN_SYS_UI (off)
+-  REX_KERNEL_STATE()->BroadcastNotification(0x00000009, 0);
++  // XN_SYS_UI on, then off a bit later, like a real Guide open/cancel. Games
++  // (DOA4's DOA ONLINE) wait for the on->off edge before re-checking sign-in;
++  // off alone leaves them waiting forever. Delay matches xeXamDispatchDialog.
++  REX_KERNEL_STATE()->BroadcastNotification(0x00000009, 1);
++  std::thread([] {
++    std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    REX_KERNEL_STATE()->BroadcastNotification(0x00000009, 0);
++  }).detach();
+   return X_ERROR_SUCCESS;
+ }
+ 
+-- 
+2.49.0.windows.1
+

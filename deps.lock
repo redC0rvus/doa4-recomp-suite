@@ -1,0 +1,15 @@
+# Locked external dependencies. Change only via the SDK upgrade procedure
+# (xbox360-recomp skill: references/sdk-versioning.md), in one commit with patches/sdk/.
+# key = value; '#' starts a comment.
+
+sdk_url            = https://github.com/rexglue/rexglue-sdk.git
+sdk_commit         = c94f5ebdcb3c9d1a460ca48e04f9758448f8d518            # full 40-char SHA; never a tag
+sdk_label          = v0.10.0-2-gc94f5eb          # human label only, e.g. v0.10.0-2-gc94f5eb
+sdk_archive_url    =                        # release asset from tools/snapshot_sdk.ps1 (empty = clone upstream)
+sdk_archive_sha256 = 15FA630FF0CD55751891143CE60AF5022D7C81C8E97B62A0776A84786443C811  # out/sdk-snapshot/rexglue-sdk-c94f5ebdcb3c.tar.gz (main checkout), built 2026-10-21; not reproducible byte-for-byte, upload this file
+
+# Toolchain the lock was tested with.
+tested_llvm_major  = 23
+min_cmake          = 3.25
+min_python         = 3.8
+tested_vs          = 2022

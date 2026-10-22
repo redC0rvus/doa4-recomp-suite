@@ -1,0 +1,75 @@
+From 3f522e4c4d06f5487113cc886c887eb459ec432d Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 22:46:40 -0700
+Subject: [PATCH 18/24] [general] d3d12: --capture_on_rb=N captures the N guest
+ frames after an RB press under RenderDoc
+
+Debug aid for one-off effects triggered by a button (DOA4 replay-camera snapshot). Reads pad 0 through XInput, names each capture <template>_rb<press>_<frame>. F11 single-frame capture is unchanged when the cvar is 0.
+---
+ src/graphics/d3d12/command_processor.cpp | 34 +++++++++++++++++++++++-
+ 1 file changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 3075405..bc4cc48 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -58,6 +58,9 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+                     "Submit command list when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_INT32(capture_on_rb, 0, "GPU",
++                     "Debug, under RenderDoc: an RB press on pad 0 captures the next N guest frames");
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -2273,16 +2276,45 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+ 
+   // DOAX2 debug: under RenderDoc, F11 captures one whole guest frame (swap to
+   // swap). RenderDoc's own F12 only grabs the presenter's blit.
++  // --capture_on_rb=N: an RB press on pad 0 captures the next N frames, one capture each.
+   static auto renderdoc = rex::ui::RenderDocAPI::CreateIfConnected();
+   static bool capturing = false;
+   static bool f11_was_down = false;
++  static uint32_t rb_seen = 0;
++  static int32_t rb_frames_left = 0;
+   if (renderdoc) {
+     bool f11_down = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
++    if (REXCVAR_GET(capture_on_rb) > 0) {
++      // XInput pad 0, loaded on first use (no link dependency).
++      using GetStateFn = DWORD(WINAPI*)(DWORD, void*);
++      static auto get_state = reinterpret_cast<GetStateFn>(
++          GetProcAddress(LoadLibraryW(L"xinput1_4.dll"), "XInputGetState"));
++      struct { DWORD packet; WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; } pad{};
++      uint32_t rb = get_state && get_state(0, &pad) == 0 && (pad.buttons & 0x0200);
++      bool pressed = rb && !rb_seen;
++      rb_seen = rb;
++      if (pressed && rb_frames_left == 0) {
++        rb_frames_left = REXCVAR_GET(capture_on_rb);
++        REXGPU_INFO("capture_on_rb: RB pressed, capturing {} frames", rb_frames_left);
++      }
++    }
+     if (capturing) {
+       renderdoc->api_1_0_0()->EndFrameCapture(nullptr, nullptr);
+       capturing = false;
+       REXGPU_INFO("DOAX2: RenderDoc guest-frame capture finished");
+-    } else if (f11_down && !f11_was_down) {
++    }
++    if (rb_frames_left > 0) {
++      rb_frames_left--;
++      // One file per frame: <template>_rb<press>_<frame>.
++      static std::string base = renderdoc->api_1_0_0()->GetLogFilePathTemplate();
++      static int press = 0;
++      if (rb_frames_left == REXCVAR_GET(capture_on_rb) - 1) press++;
++      std::string t = base + "_rb" + std::to_string(press) + "_" +
++                      std::to_string(REXCVAR_GET(capture_on_rb) - 1 - rb_frames_left);
++      renderdoc->api_1_0_0()->SetLogFilePathTemplate(t.c_str());
++      renderdoc->api_1_0_0()->StartFrameCapture(nullptr, nullptr);
++      capturing = true;
++    } else if (!capturing && f11_down && !f11_was_down && !REXCVAR_GET(capture_on_rb)) {
+       renderdoc->api_1_0_0()->StartFrameCapture(nullptr, nullptr);
+       capturing = true;
+     }
+-- 
+2.49.0.windows.1
+

@@ -1,0 +1,415 @@
+From 5b73ec6117fb71d384f15debb3207a2d558a930c Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 23:25:19 -0700
+Subject: [PATCH 23/24] [general] perf: --latency_log=path writes a
+ per-guest-frame input/vblank/VdSwap/kick/CP/Present timing CSV (dev)
+
+One row per VdSwap: first GetState poll of user 0 and the first one that saw a
+new button press, the last guest vblank before it, VdSwap, when the guest's ring
+write pointer kicked the indirect buffer holding the swap packet, when the CP
+executed the swap, and the first host Present showing that frame. Off (no-op)
+unless the cvar is set.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/perf/latency.h             |  33 ++++++
+ include/rex/ui/presenter.h             |   2 +
+ src/core/CMakeLists.txt                |   1 +
+ src/core/perf/latency.cpp              | 157 +++++++++++++++++++++++++
+ src/graphics/command_processor.cpp     |  23 +++-
+ src/graphics/graphics_system.cpp       |   3 +
+ src/input/input_system.cpp             |   7 ++
+ src/kernel/xboxkrnl/xboxkrnl_video.cpp |   3 +
+ src/ui/d3d12/d3d12_presenter.cpp       |   4 +
+ src/ui/presenter.cpp                   |   2 +
+ 10 files changed, 234 insertions(+), 1 deletion(-)
+ create mode 100644 include/rex/perf/latency.h
+ create mode 100644 src/core/perf/latency.cpp
+
+diff --git a/include/rex/perf/latency.h b/include/rex/perf/latency.h
+new file mode 100644
+index 0000000..d745a5b
+--- /dev/null
++++ b/include/rex/perf/latency.h
+@@ -0,0 +1,33 @@
++/**
++ * @file        perf/latency.h
++ * @brief       Dev-only input-to-present latency log (--latency_log=path.csv)
++ *
++ * One CSV row per guest frame (frame N = the Nth VdSwap): first GetState poll,
++ * first poll that saw a new button press, last guest vblank before that poll,
++ * VdSwap, the command processor's swap, and the first host Present showing it.
++ * All calls are no-ops unless the cvar is set.
++ */
++#pragma once
++
++#include <cstdint>
++
++namespace rex::perf::latency {
++
++bool Enabled();
++// Input: every GetState of user 0; new_press = a button went down since the last poll.
++void OnPoll(bool new_press);
++void OnVblank();
++// Guest VdSwap (packet_address = physical address of its swap packet in the ring); also
++// writes finished rows.
++void OnVdSwap(uint32_t packet_address);
++// Guest kicked an indirect buffer (physical address, bytes) to the CP through the ring write
++// pointer; stamps the swap packets inside it.
++void OnKick(uint32_t ib_address, uint32_t ib_size);
++// Command processor executing a swap packet; returns its frame number.
++uint64_t OnCpSwap();
++// Latest frame the command processor swapped (0 = none yet).
++uint64_t CpFrame();
++// Host Present of an image that holds this frame.
++void OnPresent(uint64_t frame);
++
++}  // namespace rex::perf::latency
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index afb4a30..4d86b77 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -407,6 +407,8 @@ class Presenter {
+     uint32_t display_aspect_ratio_x;
+     uint32_t display_aspect_ratio_y;
+     bool is_8bpc;
++    // Guest frame (swap number) in this image, for --latency_log.
++    uint64_t latency_frame = 0;
+ 
+     GuestOutputProperties() { SetToInactive(); }
+ 
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 1ddafd0..ac087e7 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -15,6 +15,7 @@ add_library(rexcore OBJECT
+     logging.cpp
+     memory.cpp
+     mutex.cpp
++    perf/latency.cpp
+     ring_buffer.cpp
+     string_buffer.cpp
+     threading.cpp
+diff --git a/src/core/perf/latency.cpp b/src/core/perf/latency.cpp
+new file mode 100644
+index 0000000..aaa0b71
+--- /dev/null
++++ b/src/core/perf/latency.cpp
+@@ -0,0 +1,157 @@
++/**
++ * @file        core/perf/latency.cpp
++ * @brief       Dev-only input-to-present latency log, see rex/perf/latency.h
++ */
++#include <rex/perf/latency.h>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <mutex>
++
++REXCVAR_DEFINE_STRING(latency_log, "", "Perf",
++                      "Dev: write a per-guest-frame input/vblank/VdSwap/Present timing CSV "
++                      "to this path (empty = off)");
++
++namespace rex::perf::latency {
++
++namespace {
++
++// A row is written this many VdSwaps after its own, so its Present has landed.
++// ponytail: a frame still unpresented after 16 frames logs present=0 (dropped).
++constexpr uint64_t kWriteLag = 16;
++constexpr uint64_t kRows = 4096;
++
++struct Row {
++  std::atomic<int64_t> vblank, poll, press, vdswap, kick, cpswap, present;
++  std::atomic<int32_t> polls, queued;
++  std::atomic<uint32_t> packet;
++};
++
++std::array<Row, kRows> g_rows;
++std::atomic<uint64_t> g_vdswaps{0}, g_cpswaps{0}, g_written{0};
++std::atomic<uint64_t> g_unkicked{1};  // oldest frame whose swap packet the guest hasn't kicked
++std::atomic<int64_t> g_last_vblank{0};
++std::FILE* g_file = nullptr;
++std::mutex g_file_mutex;
++
++// steady_clock is QueryPerformanceCounter on Windows; microseconds since start.
++int64_t Now() {
++  static const auto t0 = std::chrono::steady_clock::now();
++  return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
++                                                               t0)
++             .count() +
++         1;  // 0 means "no event"
++}
++
++Row& RowFor(uint64_t frame) { return g_rows[frame % kRows]; }
++
++void SetOnce(std::atomic<int64_t>& slot, int64_t value) {
++  int64_t expected = 0;
++  slot.compare_exchange_strong(expected, value, std::memory_order_relaxed);
++}
++
++void WriteRow(uint64_t frame) {
++  Row& r = RowFor(frame);
++  std::lock_guard<std::mutex> lock(g_file_mutex);
++  if (!g_file) {
++    g_file = std::fopen(REXCVAR_GET(latency_log).c_str(), "w");
++    if (!g_file) {
++      REXLOG_ERROR("latency_log: cannot open {}", REXCVAR_GET(latency_log));
++      return;
++    }
++    std::fputs("frame,t_vblank,t_poll,t_press,polls,t_vdswap,cp_queued,t_kick,t_cpswap,t_present\n",
++               g_file);
++    REXLOG_INFO("latency_log: writing {}", REXCVAR_GET(latency_log));
++  }
++  std::fprintf(g_file, "%llu,%lld,%lld,%lld,%d,%lld,%d,%lld,%lld,%lld\n",
++               static_cast<unsigned long long>(frame), static_cast<long long>(r.vblank.load()),
++               static_cast<long long>(r.poll.load()), static_cast<long long>(r.press.load()),
++               r.polls.load(), static_cast<long long>(r.vdswap.load()), r.queued.load(),
++               static_cast<long long>(r.kick.load()), static_cast<long long>(r.cpswap.load()),
++               static_cast<long long>(r.present.load()));
++  if (frame % 60 == 0) {
++    std::fflush(g_file);
++  }
++  g_written.store(frame, std::memory_order_relaxed);
++  for (auto* a : {&r.vblank, &r.poll, &r.press, &r.vdswap, &r.kick, &r.cpswap, &r.present}) {
++    a->store(0, std::memory_order_relaxed);
++  }
++  r.polls.store(0, std::memory_order_relaxed);
++  r.queued.store(0, std::memory_order_relaxed);
++}
++
++}  // namespace
++
++bool Enabled() {
++  static const bool enabled = !REXCVAR_GET(latency_log).empty();
++  return enabled;
++}
++
++void OnPoll(bool new_press) {
++  if (!Enabled()) return;
++  int64_t t = Now();
++  // Polls before the next VdSwap belong to the frame that VdSwap ends.
++  Row& r = RowFor(g_vdswaps.load(std::memory_order_relaxed) + 1);
++  int64_t expected = 0;
++  if (r.poll.compare_exchange_strong(expected, t, std::memory_order_relaxed)) {
++    r.vblank.store(g_last_vblank.load(std::memory_order_relaxed), std::memory_order_relaxed);
++  }
++  r.polls.fetch_add(1, std::memory_order_relaxed);
++  if (new_press) {
++    SetOnce(r.press, t);
++  }
++}
++
++void OnVblank() {
++  if (!Enabled()) return;
++  g_last_vblank.store(Now(), std::memory_order_relaxed);
++}
++
++void OnVdSwap(uint32_t packet_address) {
++  if (!Enabled()) return;
++  int64_t t = Now();
++  uint64_t n = g_vdswaps.load(std::memory_order_relaxed) + 1;
++  Row& r = RowFor(n);
++  r.vdswap.store(t, std::memory_order_relaxed);
++  r.packet.store(packet_address, std::memory_order_relaxed);
++  // Earlier frames the command processor hasn't swapped yet.
++  r.queued.store(int32_t((n - 1) - g_cpswaps.load(std::memory_order_relaxed)),
++                 std::memory_order_relaxed);
++  g_vdswaps.store(n, std::memory_order_release);
++  if (n > kWriteLag) {
++    WriteRow(n - kWriteLag);
++  }
++}
++
++void OnKick(uint32_t ib_address, uint32_t ib_size) {
++  if (!Enabled()) return;
++  int64_t t = Now();
++  // Swap packets go out in order, so stamp the oldest unkicked frames while they fall inside.
++  uint64_t f = g_unkicked.load(std::memory_order_relaxed);
++  for (; f <= g_vdswaps.load(std::memory_order_acquire); ++f) {
++    if (RowFor(f).packet.load(std::memory_order_relaxed) - ib_address >= ib_size) break;
++    SetOnce(RowFor(f).kick, t);
++  }
++  g_unkicked.store(f, std::memory_order_relaxed);
++}
++
++uint64_t OnCpSwap() {
++  if (!Enabled()) return 0;
++  uint64_t n = g_cpswaps.fetch_add(1, std::memory_order_relaxed) + 1;
++  SetOnce(RowFor(n).cpswap, Now());
++  return n;
++}
++
++uint64_t CpFrame() { return g_cpswaps.load(std::memory_order_relaxed); }
++
++void OnPresent(uint64_t frame) {
++  if (!Enabled() || !frame || frame <= g_written.load(std::memory_order_relaxed)) return;
++  SetOnce(RowFor(frame).present, Now());
++}
++
++}  // namespace rex::perf::latency
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 2839c84..3ca381f 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -18,6 +18,7 @@
+ #include <fmt/format.h>
+ 
+ #include <rex/cvar.h>
++#include <rex/perf/latency.h>
+ #include <rex/dbg.h>
+ #include <rex/perf/counter.h>
+ #include <rex/chrono/clock.h>
+@@ -335,7 +336,26 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
+ }
+ 
+ void CommandProcessor::UpdateWritePointer(uint32_t value) {
+-  write_ptr_index_ = value;
++  uint32_t old_value = write_ptr_index_.exchange(value);
++  if (rex::perf::latency::Enabled() && old_value != 0xBAADF00D && primary_buffer_size_) {
++    // VdSwap writes its packet into a D3D indirect buffer; report the IBs this update kicks.
++    auto* ring = reinterpret_cast<const uint32_t*>(memory_->TranslatePhysical(primary_buffer_ptr_));
++    uint32_t ring_dwords = primary_buffer_size_ / 4;
++    for (uint32_t i = old_value % ring_dwords, guard = 0; i != value % ring_dwords && guard < 4096;
++         ++guard) {
++      uint32_t header = rex::byte_swap(ring[i]);
++      uint32_t type = header >> 30;
++      uint32_t count = type == 2 ? 0 : type == 1 ? 2 : ((header >> 16) & 0x3FFF) + 1;
++      uint32_t opcode = (header >> 8) & 0x7F;
++      if (type == 3 && count >= 2 &&
++          (opcode == xenos::PM4_INDIRECT_BUFFER || opcode == xenos::PM4_INDIRECT_BUFFER_PFD)) {
++        uint32_t list_ptr = xenos::CpuToGpu(rex::byte_swap(ring[(i + 1) % ring_dwords]));
++        uint32_t list_length = rex::byte_swap(ring[(i + 2) % ring_dwords]) & 0xFFFFF;
++        rex::perf::latency::OnKick(list_ptr, list_length * 4);
++      }
++      i = (i + 1 + count) % ring_dwords;
++    }
++  }
+   write_ptr_index_event_->Set();
+ }
+ 
+@@ -975,6 +995,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
+   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+ 
++  rex::perf::latency::OnCpSwap();
+   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+ 
+   ++counter_;
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 8f2fcb0..507c308 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -24,6 +24,7 @@
+ #include <rex/graphics/flags.h>
+ #include <rex/kernel/xboxkrnl/video.h>
+ #include <rex/logging.h>
++#include <rex/perf/latency.h>
+ #include <rex/stream.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xthread.h>
+@@ -320,6 +321,8 @@ void GraphicsSystem::MarkVblank() {
+   // TODO: Enable profiling once ported
+   // SCOPE_profile_cpu_f("gpu");
+ 
++  rex::perf::latency::OnVblank();
++
+   // Increment vblank counter (so the game sees us making progress).
+   if (command_processor_) {
+     command_processor_->increment_counter();
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index b26f760..6fecb18 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -23,6 +23,7 @@
+ #include <rex/input/state_merge.h>
+ #include <rex/input/xinput/xinput_input_driver.h>
+ #include <rex/logging.h>
++#include <rex/perf/latency.h>
+ 
+ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput")
+     .allowed({"sdl", "xinput"});
+@@ -248,6 +249,12 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   if (pad_filter_) {
+     pad_filter_(user_index, merged.gamepad);
+   }
++  if (user_index == 0 && rex::perf::latency::Enabled()) {
++    static uint16_t last_buttons = 0;
++    uint16_t buttons = static_cast<uint16_t>(merged.gamepad.buttons);
++    rex::perf::latency::OnPoll((buttons & ~last_buttons) != 0);
++    last_buttons = buttons;
++  }
+   if (out_state) {
+     *out_state = merged;
+   }
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index 1254710..3711b5f 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -25,6 +25,7 @@
+ #include <rex/kernel/xboxkrnl/rtl.h>
+ #include <rex/kernel/xboxkrnl/video.h>
+ #include <rex/logging.h>
++#include <rex/perf/latency.h>
+ #include <rex/hook.h>
+ #include <rex/types.h>
+ #include <rex/runtime.h>
+@@ -518,6 +519,8 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+   for (uint32_t i = offset; i < 64; i++) {
+     dwords[i] = xenos::MakePacketType2();
+   }
++  rex::perf::latency::OnVdSwap(
++      REX_KERNEL_MEMORY()->GetPhysicalAddress(buffer_ptr.guest_address()));
+ }
+ 
+ void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 306118e..0824f54 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -18,6 +18,7 @@
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+ #include <rex/logging.h>
++#include <rex/perf/latency.h>
+ #include <rex/math.h>
+ #include <rex/ui/d3d12/d3d12_presenter.h>
+ #include <rex/ui/d3d12/d3d12_provider.h>
+@@ -1161,6 +1162,9 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   // Even if presentation has failed, work might have been enqueued anyway
+   // internally before the failure according to Jesse Natalie from the DirectX
+   // Discord server.
++  if (guest_output_resource) {
++    perf::latency::OnPresent(guest_output_properties.latency_frame);
++  }
+   paint_context_.present_submission_tracker.NextSubmission();
+   switch (present_result) {
+     case DXGI_ERROR_DEVICE_REMOVED:
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..3ce8333 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -17,6 +17,7 @@
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+ #include <rex/logging.h>
++#include <rex/perf/latency.h>
+ #include <rex/platform.h>
+ #include <rex/ui/presenter.h>
+ #include <rex/ui/window.h>
+@@ -557,6 +558,7 @@ bool Presenter::RefreshGuestOutput(
+   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
+   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
+   writable_properties.is_8bpc = false;
++  writable_properties.latency_frame = perf::latency::CpFrame();
+   bool is_active = writable_properties.IsActive();
+   if (is_active) {
+     if (!RefreshGuestOutputImpl(guest_output_mailbox_writable_, frontbuffer_width,
+-- 
+2.49.0.windows.1
+

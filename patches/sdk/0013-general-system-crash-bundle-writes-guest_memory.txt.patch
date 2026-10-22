@@ -1,0 +1,83 @@
+From 0ff3d22f450c2053251c941a0bd8e4318c164d2d Mon Sep 17 00:00:00 2001
+From: redC0rvus <111829302+redC0rvus@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 08:41:07 -0700
+Subject: [PATCH 13/24] [general] system: crash bundle writes guest_memory.txt
+
+All GPRs plus 256-byte hex dumps of guest memory at each register that points into committed guest memory, one level deep. Reads are VirtualQuery-checked so the handler can't fault on reserved pages.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/crash_bundle.cpp | 50 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+diff --git a/src/system/crash_bundle.cpp b/src/system/crash_bundle.cpp
+index 7801c50..05b6858 100644
+--- a/src/system/crash_bundle.cpp
++++ b/src/system/crash_bundle.cpp
+@@ -99,6 +99,52 @@ void WriteGuestState(std::ofstream& out) {
+   }
+ }
+ 
++// True if [p, p+len) is committed, readable host memory (guest pages may be
++// reserved but never committed; touching those in here would fault again).
++bool Readable(const uint8_t* p, size_t len) {
++  MEMORY_BASIC_INFORMATION mbi;
++  for (const uint8_t* q = p; q < p + len;) {
++    if (!VirtualQuery(q, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
++        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
++      return false;
++    q = static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
++  }
++  return true;
++}
++
++// All GPRs, then 256 bytes of guest memory around each register that points
++// into committed guest memory, one level deep (e.g. a stream pointer kept in
++// a struct a register points at). Enough to read the data a crash was chewing.
++void WriteGuestMemory(std::ofstream& out) {
++  auto* ts = runtime::ThreadState::Get();
++  auto* rt = Runtime::instance();
++  if (!ts || !rt || !rt->virtual_membase()) return;
++  auto* ctx = ts->context();
++  uint8_t* base = rt->virtual_membase();
++  const PPCRegister* gpr = &ctx->r0;
++  for (int i = 0; i < 32; ++i)
++    out << fmt::format("r{:<2} {:016X}{}", i, gpr[i].u64, i % 4 == 3 ? "\n" : "  ");
++  out << fmt::format("lr  {:08X}  ctr {:016X}\n", uint32_t(ctx->lr), ctx->ctr.u64);
++
++  auto dump = [&](const std::string& label, uint32_t addr) {
++    uint32_t start = (addr & ~0xFu) - 0x40;
++    if (addr < 0x10000 || !Readable(base + start, 0x100)) return false;
++    out << fmt::format("\n{} -> {:08X}\n", label, addr);
++    for (uint32_t row = 0; row < 0x100; row += 16) {
++      out << fmt::format("  {:08X}:", start + row);
++      for (uint32_t b = 0; b < 16; ++b) out << fmt::format("{}{:02X}", b % 4 ? "" : " ", base[start + row + b]);
++      out << "\n";
++    }
++    return true;
++  };
++  for (int i = 0; i < 32; ++i) {
++    uint32_t a = gpr[i].u32;
++    if (!dump(fmt::format("r{}", i), a)) continue;
++    uint32_t inner = _byteswap_ulong(*reinterpret_cast<uint32_t*>(base + (a & ~3u)));
++    dump(fmt::format("*r{}", i), inner);
++  }
++}
++
+ void WriteHostStack(std::ofstream& out) {
+   HANDLE proc = GetCurrentProcess();
+   SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+@@ -163,6 +209,10 @@ void WriteBundle(const std::string& failure, EXCEPTION_POINTERS* ep) {
+     out.flush();
+     WriteHostStack(out);
+   }
++  {
++    std::ofstream out(dir / "guest_memory.txt");
++    WriteGuestMemory(out);
++  }
+   if (g_breadcrumbs) {
+     std::ofstream out(dir / "breadcrumbs.txt");
+     for (auto& line : g_breadcrumbs->last_formatted()) out << line;
+-- 
+2.49.0.windows.1
+
