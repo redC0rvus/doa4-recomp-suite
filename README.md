@@ -27,13 +27,15 @@ Play Dead or Alive 4 natively on Windows, from your own Xbox 360 disc. The game'
 2. Put your disc image (`.iso`, any file name) in the **`game iso`** folder. If there are several, setup asks which one to use.
 3. Double-click **`setup.bat`**.
 
-It checks your tools, extracts the disc image and verifies `default.xex`, downloads the ReXGlue SDK at the tested version, applies this project's SDK patches (`patches/sdk/`), builds the SDK and the game, and then starts the game. The first build takes about 10-30 minutes. Running `setup.bat` again skips the steps that are already done. After a successful setup you can delete the `.iso` from `game iso` (the extracted copy is kept).
+It checks your tools, extracts the disc image and verifies `default.xex`, downloads the ReXGlue SDK at the tested version, applies this project's SDK patches (`patches/sdk/`), builds the SDK and the game into the `Dead or Alive 4` folder, and then starts the game. The first build takes about 10-30 minutes. Running `setup.bat` again skips the steps that are already done. After a successful setup you can delete the `.iso` from `game iso` (the extracted copy is kept).
 
 ## Play
-Double-click **`Dead or Alive 4.exe`** in the repository folder (setup builds it there). The first launch opens the settings; **Save & Play** starts the game, and after that it starts directly. Pin it to Start or make a desktop shortcut if you like.
+Setup puts the finished game in its own folder, **`Dead or Alive 4`**, inside the repository folder. Double-click **`Dead or Alive 4.exe`** in it. The first launch opens the settings; **Save & Play** starts the game, and after that it starts directly. Pin it to Start or make a desktop shortcut if you like.
+
+The `Dead or Alive 4` folder runs on its own: move it anywhere you like (another drive, `C:\Games`, ...). It holds the launcher and settings exes, the game in `bin\`, and the game files in `game\`. Inside the repository folder, `game\` costs no extra disk space (its files are hard links to `original rom\extracted`), and it keeps them if you delete the repository folder. Saves are in `Documents\doa4`, so moving the folder doesn't affect them.
 
 ### Settings (`Dead or Alive 4 Settings.exe`)
-Saved to `doa4.toml` in the repository folder; changes apply at the next launch.
+Saved to `doa4.toml` in the `Dead or Alive 4` folder; changes apply at the next launch.
 - **Resolution:** 720p (native), 1440p or 4K internal rendering. The default is the largest that fits your tallest monitor.
 - **Fullscreen**
 - **Gamertag:** your in-game name (up to 15 characters).
@@ -64,11 +66,11 @@ Xbox and other gamepads work out of the box, and the keyboard works at the same 
 - **`No disc image found`** or **`No disc image picked`**: put your Dead or Alive 4 `.iso` in the `game iso` folder (or type a number from the list), then run `setup.bat` again.
 - **`The game is not built yet`**: double-click `setup.bat` (Setup) and check that it ends with `BUILD_OK`.
 - **`SETUP FAILED`**: the line above it says why; fix that and double-click `setup.bat` again.
-- **The game crashes:** it writes a folder `crashes\<timestamp>\` (log, stack, last frame). Attach that folder to your bug report.
+- **The game crashes:** it writes a folder `crashes\<timestamp>\` (log, stack, last frame) in the `Dead or Alive 4` folder. Attach that folder to your bug report.
 - **Bug report checklist:** the `crashes\<timestamp>` folder if there is one, a screenshot (`pwsh tools/shot.ps1` prints its path while the game runs), and the result of `pwsh tools/smoke.ps1` with the game closed (it boots to the mode-select screen and prints PASS or what failed).
 
 ## Rebuilding
-After pulling a new version, double-click `setup.bat` again.
+After pulling a new version, double-click `setup.bat` again. It updates the `Dead or Alive 4` folder in the repository folder and keeps your settings. If you moved the folder, update it in place with `pwsh tools/package.ps1 -Dest "D:\Games\Dead or Alive 4"` (your folder's path), or copy the new `bin\` and the two exes over the moved folder.
 
 ## License
 BSD-3-Clause (`LICENSE`). Third-party components and their licenses: `THIRD_PARTY_NOTICES.md`. Dead or Alive is a trademark of Koei Tecmo; this project is not affiliated with or endorsed by Koei Tecmo or Microsoft.

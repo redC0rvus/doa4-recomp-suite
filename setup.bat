@@ -1,6 +1,7 @@
 @echo off
 rem Double-click: installs missing build tools (winget), extracts the disc image from "game iso\", fetches and patches
-rem the ReXGlue SDK, builds the game, then starts it. Re-running skips finished steps.
+rem the ReXGlue SDK, builds the game into the movable "Dead or Alive 4" folder, then starts it. Re-running skips
+rem finished steps.
 rem Extra arguments pass to tools\setup.ps1 (devs: setup.bat -Iso "D:\path\to\disc.iso").
 cd /d "%~dp0"
 call :findpwsh
@@ -13,7 +14,7 @@ if not defined PWSH (echo PowerShell 7 was installed, but pwsh.exe was not found
 :run
 "%PWSH%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\setup.ps1" %*
 if errorlevel 1 (echo. & echo SETUP FAILED: see the message above. & pause & exit /b 1)
-start "" "%~dp0Dead or Alive 4.exe"
+start "" "%~dp0Dead or Alive 4\Dead or Alive 4.exe"
 exit /b 0
 
 rem Sets PWSH to pwsh.exe: the MSI install dir, the MSIX app alias (what winget installs now), or anything on PATH.

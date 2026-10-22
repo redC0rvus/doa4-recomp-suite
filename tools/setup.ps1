@@ -141,4 +141,7 @@ Step 'Building SDK + game (first build takes a while: SDK, then codegen of the w
 $env:REXGLUE_SDK = $sdkDir
 & (Join-Path $PSScriptRoot 'build.ps1') -Sdk
 
-"`nDone. Double-click 'Dead or Alive 4.exe' in $root to play (the first launch opens the settings)."
+Step 'Game folder'
+& (Join-Path $PSScriptRoot 'package.ps1')
+
+"`nDone. Double-click 'Dead or Alive 4.exe' in $(Join-Path $root 'Dead or Alive 4') to play (the first launch opens the settings)."

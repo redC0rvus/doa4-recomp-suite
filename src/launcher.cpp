@@ -1,5 +1,5 @@
 // Player-facing launcher and settings dialog, plain Win32 (no SDK). CMakeLists.txt builds it twice into the
-// project root:
+// project root (tools/package.ps1 also copies both into the portable "Dead or Alive 4" folder):
 //   "Dead or Alive 4.exe"           starts the game; the first plain launch (no doa4.toml) opens the settings first.
 //   "Dead or Alive 4 Settings.exe"  (DOA4_SETTINGS_ONLY) the settings dialog only.
 // doa4.toml in the project root (untracked) is the source of truth: the launcher copies it next to the game exe
@@ -158,7 +158,10 @@ static INT_PTR ShowSettings() {
 }
 
 static int Launch(const std::wstring& extra) {
-  fs::path game = (g_root / DOA4_GAME_EXE).make_preferred();
+  // Portable game folder (tools/package.ps1): game exe in bin\, disc in game\. Otherwise the suite/dev tree.
+  bool pkg = fs::exists(g_root / L"bin" / L"doa4.exe");
+  fs::path game = pkg ? g_root / L"bin" / L"doa4.exe" : (g_root / DOA4_GAME_EXE).make_preferred();
+  fs::path data = pkg ? g_root / L"game" : g_root / L"original rom" / L"extracted";
   if (!fs::exists(game)) {
     Message(L"The game is not built yet (" + game.wstring() + L" is missing).\n\nDouble-click setup.bat (see README.md).",
             MB_ICONERROR);
@@ -182,8 +185,8 @@ static int Launch(const std::wstring& extra) {
   auto quoted = [](const fs::path& p) { return L"\"" + p.wstring() + L"\""; };
   std::wstring cmd = quoted(game) +
       // Required: the game does not work right without these.
-      //   Extracted disc (setup.bat puts it here).
-      L" --game_data_root=" + quoted(g_root / L"original rom" / L"extracted") +
+      //   Extracted disc (setup.bat puts it in original rom\extracted; package.ps1 links it into game\).
+      L" --game_data_root=" + quoted(data) +
       //   Buffers above 256 MB so the game's "offset < base -> relocate" check works (Brad/Hayabusa motion, SDK 0015).
       L" --guest_low_reserve_mb=256"
       //   CPU reads of GPU resolves: replay-camera autofocus and photo encode (SDK 0020); ~40 fps vs ~16 with fast.
