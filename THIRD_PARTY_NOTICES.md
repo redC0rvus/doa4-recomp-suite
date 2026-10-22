@@ -1,6 +1,6 @@
 # Third-party notices
 
-This suite's own code is BSD-3-Clause (`LICENSE`). It contains no game code or data: you supply your own Dead or Alive 4 disc image, and `tools/setup.ps1` builds everything on your machine. Dead or Alive is a trademark of Koei Tecmo; this project is not affiliated with or endorsed by Koei Tecmo or Microsoft.
+This suite's own code is BSD-3-Clause (`LICENSE`). It contains no game code or data: you supply your own Dead or Alive 4 disc image, and `setup.bat` builds everything on your machine. Dead or Alive is a trademark of Koei Tecmo; this project is not affiliated with or endorsed by Koei Tecmo or Microsoft.
 
 ## What is redistributed
 - **This repository:** the suite's own source, plus `patches/sdk/*.patch` (changes to the ReXGlue SDK, released under the SDK's BSD-3-Clause license below).

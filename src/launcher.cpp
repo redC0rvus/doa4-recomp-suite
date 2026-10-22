@@ -160,7 +160,7 @@ static INT_PTR ShowSettings() {
 static int Launch(const std::wstring& extra) {
   fs::path game = (g_root / DOA4_GAME_EXE).make_preferred();
   if (!fs::exists(game)) {
-    Message(L"The game is not built yet (" + game.wstring() + L" is missing).\n\nRun: pwsh tools/setup.ps1 (see README.md).",
+    Message(L"The game is not built yet (" + game.wstring() + L" is missing).\n\nDouble-click setup.bat (see README.md).",
             MB_ICONERROR);
     return 1;
   }
@@ -182,7 +182,7 @@ static int Launch(const std::wstring& extra) {
   auto quoted = [](const fs::path& p) { return L"\"" + p.wstring() + L"\""; };
   std::wstring cmd = quoted(game) +
       // Required: the game does not work right without these.
-      //   Extracted disc (setup.ps1 puts it here).
+      //   Extracted disc (setup.bat puts it here).
       L" --game_data_root=" + quoted(g_root / L"original rom" / L"extracted") +
       //   Buffers above 256 MB so the game's "offset < base -> relocate" check works (Brad/Hayabusa motion, SDK 0015).
       L" --guest_low_reserve_mb=256"

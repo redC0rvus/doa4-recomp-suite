@@ -1,5 +1,7 @@
 out/
 original rom/
+game iso/*
+!game iso/README.txt
 generated/default/
 thirdparty/
 crashes/
