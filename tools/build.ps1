@@ -19,7 +19,8 @@ $env:Path = "C:\Program Files\LLVM\bin;$env:LOCALAPPDATA\Microsoft\WinGet\Links;
 
 function Invoke-VS([string]$dir, [string]$cmd) {
     cmd /c "`"$vcvars`" >nul 2>nul && cd /d `"$dir`" && $cmd 2>&1" |
-        Select-String -NotMatch 'vswhere|operable program|Up-to-date:|Installing:' |
+        # 'Performing Test ... - Failed': CMake probing for POSIX/GCC features Windows lacks; expected, not an error.
+        Select-String -NotMatch 'vswhere|operable program|Up-to-date:|Installing:|Performing Test' |
         Select-String 'error:|CMake Error|FAILED|Codegen summary|Unresolved|not in any function|ninja: no work' | ForEach-Object Line
     if ($LASTEXITCODE) { throw "Build failed in $dir" }
 }
