@@ -69,18 +69,29 @@ if (-not (Test-Path $xex)) {
     if (-not $Iso) {
         $isos = @(Get-ChildItem -LiteralPath $isoDir -Filter *.iso -File -ErrorAction SilentlyContinue)
         if (-not $isos) { throw "No disc image found. Put your Dead or Alive 4 disc image (.iso) in '$isoDir', then run setup.bat again." }
-        if ($isos.Count -gt 1) { throw "More than one .iso in '$isoDir':`n  $($isos.Name -join "`n  ")`nKeep only your Dead or Alive 4 disc image there, then run setup.bat again." }
+        # Any file name works (dumps are named by whoever made them); with several, the player picks one.
+        if ($isos.Count -gt 1) {
+            Write-Host "  Several disc images in '$isoDir':"
+            for ($i = 0; $i -lt $isos.Count; $i++) { Write-Host "    [$($i + 1)] $($isos[$i].Name)" }
+            $pick = Read-Host '  Which one is Dead or Alive 4? Type its number and press Enter'
+            if ($pick -notmatch '^\d+$' -or [int]$pick -lt 1 -or [int]$pick -gt $isos.Count) {
+                throw "No disc image picked ('$pick'). Run setup.bat again and type a number from the list, or keep only one .iso in '$isoDir'."
+            }
+            $isos = @($isos[[int]$pick - 1])
+        }
         $Iso = $isos[0].FullName
         "  disc image: $($isos[0].Name)"
     }
     # -LiteralPath: dump names like "Dead or Alive 4 [PAL][NTSCU].iso" are wildcards to Test-Path.
     if (-not (Test-Path -LiteralPath $Iso)) { throw "ISO not found: $Iso" }
     python (Join-Path $PSScriptRoot 'extract_xiso.py') $Iso $extracted
-    if ($LASTEXITCODE) { throw 'Extraction failed.' }
+    if ($LASTEXITCODE) { Remove-Item -LiteralPath $extracted -Recurse -Force -ErrorAction SilentlyContinue; throw "Extracting $Iso failed: not an Xbox 360 disc image?" }
 } else { "  already extracted" }
 $actual = (Get-FileHash $xex -Algorithm SHA256).Hash
 if ($actual -ne $xexSha256) {
-    throw "default.xex SHA-256 is $actual, expected $xexSha256.`nOnly title 544307D1 with this exact executable is supported; a different region or title update won't match the manifest."
+    # Drop the wrong extraction, so the next run reads (or asks for) the disc image again instead of failing here forever.
+    Remove-Item -LiteralPath $extracted -Recurse -Force
+    throw "default.xex SHA-256 is $actual, expected $xexSha256.`nOnly title 544307D1 with this exact executable is supported; a different game, region or title update won't match the manifest. The extracted files were removed; run setup.bat again with the right disc image."
 }
 "  default.xex verified (544307D1)"
 
