@@ -1,6 +1,11 @@
 # Dead or Alive 4 Recomp
 <img width="2081" height="709" alt="github-banner" src="https://github.com/user-attachments/assets/e24568a6-ed53-4df5-9988-0495ca7531d8" />
 
+<p align="center">
+  <a href="https://patreon.com/c/redC0rvus"><img alt="Support on Patreon" src="https://img.shields.io/badge/Patreon-support-F96854?logo=patreon&logoColor=white"></a>
+  <a href="https://www.paypal.com/donate/?hosted_button_id=KCQYET5HGZGNQ"><img alt="Donate with PayPal" src="https://img.shields.io/badge/PayPal-donate-00457C?logo=paypal&logoColor=white"></a>
+</p>
+
 Play Dead or Alive 4 natively on Windows, from your own Xbox 360 disc. The game's code is statically recompiled from the disc's `default.xex` with the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) and rendered with Direct3D 12, at up to 4K.
 
 **Bring your own disc.** This repository contains no game code or data. You need your own disc image of Dead or Alive 4 (title ID 544307D1); everything is built on your machine.
